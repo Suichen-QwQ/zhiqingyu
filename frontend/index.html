@@ -2216,8 +2216,26 @@
      error 也不写，是因为「读不到就写」等于用本机残缺数据覆盖云端真数据 ——
      只丢一段会话，永远好过丢全部。 */
   let cloudState='pending', cloudRevision=null, cloudBusy=false, cloudGeneration=0, cloudTracking=false;
-  function cloudUnsynced(){ try{return localStorage.getItem('zqy-cloud-unsynced')==='1';}catch(e){return false;} }
-  function setCloudUnsynced(v){ try{if(v)localStorage.setItem('zqy-cloud-unsynced','1');else localStorage.removeItem('zqy-cloud-unsynced');}catch(e){} }
+  const cloudPendingPrefix='zqy-pending-';
+  const cloudTabId=(()=>{
+    try{let id=sessionStorage.getItem('zqy-tab-id');if(!id){id=Date.now().toString(36)+Math.random().toString(36).slice(2);sessionStorage.setItem('zqy-tab-id',id);}return id;}
+    catch(e){return Date.now().toString(36)+Math.random().toString(36).slice(2);}
+  })();
+  const cloudPendingKey=cloudPendingPrefix+cloudTabId;
+  function cloudPendingRecords(){
+    const out={};
+    try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&k.startsWith(cloudPendingPrefix))out[k]=JSON.parse(localStorage.getItem(k));}}catch(e){}
+    return out;
+  }
+  function cloudUnsynced(){
+    try{return localStorage.getItem('zqy-cloud-unsynced')==='1'||Object.keys(cloudPendingRecords()).length>0;}catch(e){return false;}
+  }
+  function setCloudUnsynced(v){
+    try{
+      if(v)localStorage.setItem(cloudPendingKey,JSON.stringify(snapshot()));
+      else {localStorage.removeItem(cloudPendingKey);localStorage.removeItem('zqy-cloud-unsynced');}
+    }catch(e){}
+  }
   function cloudSync(){
     if(cloudState==='pending'||cloudState==='error'||cloudBusy) return;
     if(cloudT) clearTimeout(cloudT);
@@ -2333,7 +2351,7 @@
   }
   function dbLoad(){
     let raw=null;
-    try{raw=localStorage.getItem('zqy-data');}catch(e){}
+    try{raw=localStorage.getItem(cloudPendingKey)||localStorage.getItem('zqy-data');}catch(e){}
     if(!raw){ newSession(); return; }     /* 空开始：建 1 个空会话 */
     try{
       const o=JSON.parse(raw);
@@ -5188,7 +5206,7 @@
       try{
         const stamp=keyOf(dayShift(0));
         dl('栀情屿-备份-'+stamp+'.json',
-          JSON.stringify({db:DB,memory:snap.items,memory_v2:snap.items_v2},null,2),'application/json');
+          JSON.stringify({db:DB,memory:snap.items,memory_v2:snap.items_v2,pending_tabs:cloudPendingRecords()},null,2),'application/json');
         showToast('已导出 JSON 备份');
       }catch(e){ showToast('导出失败，请重试'); }
     });
@@ -6861,7 +6879,9 @@
         cloudRevision=r.revision;
         const blob=(r&&r.data&&typeof r.data==='object')?r.data:null;
         if(!blob){ cloudState='empty'; if(cloudUnsynced()||hadLocal) cloudSync(); return; }   /* 云端没有数据 → 允许本地上推 */
-        if(!Array.isArray(blob.sessions)||!blob.sessions.length){
+        const hasCloudContent=(Array.isArray(blob.sessions)&&blob.sessions.some(s=>s&&Array.isArray(s.msgs)&&s.msgs.length))
+          ||Object.values(blob.diary||{}).some(d=>d&&((d.items&&d.items.length)||d.narrative||d.manual||d.mood));
+        if(!hasCloudContent){
           cloudState='empty';
           if(hadLocal){
             /* 云端空但本机有数据：大概率云端被误清/异常。保留本机，并把本机回推云端（cloudSync 走 dbSave 的去抖） */

@@ -47,6 +47,9 @@ MODEL = os.environ.get('DEEPSEEK_MODEL', 'deepseek-chat')
 REASONER_MODEL = os.environ.get('DEEPSEEK_REASONER_MODEL', 'deepseek-chat')
 LISTEN_HOST = os.environ.get('ZQY_LISTEN_HOST', '127.0.0.1')
 LISTEN_PORT = int(os.environ.get('ZQY_LISTEN_PORT', '8092'))
+ALLOWED_HOSTS = set(h.strip().lower() for h in os.environ.get(
+    'ZQY_ALLOWED_HOSTS', 'localhost,127.0.0.1,::1').split(',') if h.strip())
+TRUST_PROXY = os.environ.get('ZQY_TRUST_PROXY', '0') == '1'
 # 记忆：长期事实存本地 memory.md；SERVER_DIR 取本文件所在目录（不依赖 cwd）
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_FILE = os.environ.get('ZQY_MEMORY_FILE', os.path.join(SERVER_DIR, 'memory.md'))
@@ -2240,11 +2243,12 @@ def _saved_settings():
 def model_settings():
     """生效的模型设置：settings.json 覆盖 .env.secret 默认值。
 
-    api_key 空字符串 = 「用 .env.secret 里那把」，所以清除 Key 就是写空串回落默认。
+    仅默认服务地址可以回落到环境密钥；其他地址清除 Key 后保持未配置。
     """
     defaults = {'base_url': BASE_URL, 'model': MODEL,
                 'reasoner_model': REASONER_MODEL, 'timeout': 60,
                 'api_key': API_KEY}
+    saved = {}
     try:
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
             saved = json.load(f)
@@ -2254,6 +2258,10 @@ def model_settings():
                     defaults[key] = saved[key]
     except Exception:
         pass
+    if not isinstance(saved, dict):
+        saved = {}
+    if defaults['base_url'].rstrip('/') != BASE_URL.rstrip('/') and not str(saved.get('api_key') or '').strip():
+        defaults['api_key'] = ''
     defaults['base_url'] = str(defaults['base_url']).rstrip('/')
     defaults['model'] = str(defaults['model'])[:120]
     defaults['reasoner_model'] = str(defaults['reasoner_model'])[:120]
@@ -2476,7 +2484,7 @@ def public_settings(settings=None):
 
 
 def save_model_settings(data):
-    """保存模型设置。api_key 语义：非空=替换；clear_key=true=清除(回落 .env)；
+    """保存模型设置。api_key 语义：非空=替换；clear_key=true=清除；
     缺省或空串=保持原样（前端不会因为回显不了明文而误清 Key）。
     """
     current = model_settings()
@@ -3405,7 +3413,7 @@ def _chat_stream_one(cand, messages, tools, _result, think=False):
     # Accept-Encoding: identity —— 网关有的节点会不声明就 gzip，先要求不压缩
     headers = {'Content-Type': 'application/json',
                'Accept-Encoding': 'identity',
-               'Authorization': 'Bearer ' + (cand.get('api_key') or API_KEY)}
+               'Authorization': 'Bearer ' + (cand.get('api_key') or '')}
 
     def _open(p):
         return urllib.request.urlopen(urllib.request.Request(
@@ -3942,7 +3950,7 @@ def _chat_one(cand, messages, json_mode, max_tokens=2500, think=False, tools=Non
             data=body,
             headers={'Content-Type': 'application/json',
                      'Accept-Encoding': 'identity',
-                     'Authorization': 'Bearer ' + (settings['api_key'] or API_KEY)},
+                     'Authorization': 'Bearer ' + (settings['api_key'] or '')},
             method='POST',
         ), timeout=req_timeout)
 
@@ -6212,6 +6220,15 @@ class Handler(BaseHTTPRequestHandler):
     def _origin_allowed(self):
         # Browser requests must be same-origin. Non-browser clients without Origin
         # remain supported; public deployments must also use authentication.
+        try:
+            authority = urllib.parse.urlsplit('//' + (self.headers.get('Host') or ''))
+            if (not authority.hostname or authority.hostname.lower() not in ALLOWED_HOSTS
+                    or authority.username or authority.password or authority.path
+                    or authority.query or authority.fragment):
+                return False
+            authority.port  # Reject malformed ports.
+        except ValueError:
+            return False
         origin = self.headers.get('Origin')
         if not origin:
             return self.headers.get('Sec-Fetch-Site', '').lower() != 'cross-site'
@@ -6220,7 +6237,8 @@ class Handler(BaseHTTPRequestHandler):
             host = (self.headers.get('Host') or '').lower()
             return (parsed.scheme in ('http', 'https') and bool(host)
                     and parsed.netloc.lower() == host
-                    and parsed.scheme == (self.headers.get('X-Forwarded-Proto') or 'http').lower()
+                    and parsed.scheme == ((self.headers.get('X-Forwarded-Proto') or 'http').lower()
+                        if TRUST_PROXY and self.client_address[0] in ('127.0.0.1', '::1') else 'http')
                     and not parsed.username
                     and not parsed.password and not parsed.path
                     and not parsed.query and not parsed.fragment)
@@ -6391,7 +6409,7 @@ class Handler(BaseHTTPRequestHandler):
                 key = str(payload.get('api_key') or '').strip()
                 if not key:
                     if base.rstrip('/') == str(settings['base_url']).rstrip('/'):
-                        key = settings['api_key'] or API_KEY
+                        key = settings['api_key']
                     else:
                         matches = [entry for entry in saved_fallbacks()
                                    if base.rstrip('/') == str(entry['base_url']).rstrip('/')]

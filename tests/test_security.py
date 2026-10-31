@@ -39,6 +39,9 @@ class SecurityTests(unittest.TestCase):
         TEMP.cleanup()
 
     def setUp(self):
+        settings = DATA / 'settings.json'
+        if settings.exists():
+            settings.unlink()
         (DATA / 'storage.json').write_text(json.dumps({'data': {'sessions': [{'msgs': ['private-test']}]}}))
 
     def request(self, method, path, body=None, headers=None):
@@ -92,6 +95,23 @@ class SecurityTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             statuses = list(pool.map(write, ['a', 'b']))
         self.assertEqual(sorted(statuses), [200, 409])
+
+    def test_clear_custom_key_does_not_reuse_server_key(self):
+        server.save_model_settings({'base_url': 'https://custom.example/v1', 'api_key': 'fake-custom'})
+        server.save_model_settings({'clear_key': True})
+        self.assertEqual(server.model_settings()['base_url'], 'https://custom.example/v1')
+        self.assertEqual(server.model_settings()['api_key'], '')
+        self.assertEqual(server.model_chain()[0]['api_key'], '')
+
+    def test_host_allowlist_and_proxy_headers(self):
+        from unittest.mock import patch
+        bad = {'Host': 'attacker.example', 'Origin': 'http://attacker.example'}
+        self.assertEqual(self.request('GET', '/api/storage', headers=bad)[0], 403)
+        spoof = {'Origin': 'https://127.0.0.1:%s' % self.port, 'X-Forwarded-Proto': 'https'}
+        self.assertEqual(self.request('GET', '/api/storage', headers=spoof)[0], 403)
+        with patch.object(server, 'ALLOWED_HOSTS', {'app.example'}), patch.object(server, 'TRUST_PROXY', True):
+            headers = {'Host': 'app.example', 'Origin': 'https://app.example', 'X-Forwarded-Proto': 'https'}
+            self.assertEqual(self.request('GET', '/api/storage', headers=headers)[0], 200)
 
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
