@@ -5,14 +5,14 @@ const map=new Map();
 function tab(id){let timers=[],resolveFetch;const ctx={saveT:null,cloudT:null,snapshot:()=>({sessions:[{id,msgs:[id]}]}),
  sessionStorage:{getItem:()=>id,setItem:()=>{}},localStorage:{get length(){return map.size},key:i=>[...map.keys()][i],getItem:k=>map.get(k)||null,setItem:(k,v)=>map.set(k,v),removeItem:k=>map.delete(k)},
  setTimeout:f=>(timers.push(f),f),clearTimeout:f=>timers=timers.filter(x=>x!==f),showToast:()=>{},fetch:()=>new Promise(r=>resolveFetch=r)};
- vm.createContext(ctx);vm.runInContext(sync+'\nthis.api={save:dbSave,sync:cloudSync,records:cloudPendingRecords,ready:()=>{cloudState="restored";cloudTracking=true;}}',ctx);
+ vm.createContext(ctx);vm.runInContext(sync+'\nthis.api={save:dbSave,sync:cloudSync,records:cloudPendingRecords,key:cloudPendingKey,ready:()=>{cloudState="restored";cloudTracking=true;}}',ctx);
  return {ctx,run:()=>timers.shift()(),finish:r=>resolveFetch(r)};}
 (async()=>{
- const a=tab('a'),b=tab('b');a.ctx.api.ready();b.ctx.api.ready();
+ const a=tab('inherited'),b=tab('inherited');assert.notEqual(a.ctx.api.key,b.ctx.api.key);a.ctx.api.ready();b.ctx.api.ready();
  a.ctx.api.save();a.run();let pending=a.run();b.ctx.api.save();
  a.finish({ok:true,json:async()=>({ok:true,revision:'next'})});await pending;
- assert(!map.has('zqy-pending-a'));assert(map.has('zqy-pending-b'));
- assert.equal(JSON.parse(map.get('zqy-pending-b')).sessions[0].msgs[0],'b');
+ assert(!map.has(a.ctx.api.key));assert(map.has(b.ctx.api.key));
+ assert.equal(JSON.parse(map.get(b.ctx.api.key)).sessions[0].msgs[0],'inherited');
  console.log('multiple tab pending snapshots regression passed');
  const start=html.indexOf('    (async function cloudRestore(){'),end=html.indexOf('\n    })();',start)+10;
  const db={sessions:[{id:'empty',msgs:[]}],diary:{},meta:{}};

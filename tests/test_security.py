@@ -113,6 +113,71 @@ class SecurityTests(unittest.TestCase):
             headers = {'Host': 'app.example', 'Origin': 'https://app.example', 'X-Forwarded-Proto': 'https'}
             self.assertEqual(self.request('GET', '/api/storage', headers=headers)[0], 200)
 
+    def test_chat_redirects_do_not_forward_credentials(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from urllib.error import HTTPError
+        class Target(BaseHTTPRequestHandler):
+            hits = 0
+            def do_GET(self):
+                Target.hits += 1
+                self.send_response(200)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        target = HTTPServer(('127.0.0.1', 0), Target)
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header('Location', 'http://127.0.0.1:%s/target' % target.server_port)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        redirect = HTTPServer(('127.0.0.1', 0), Redirect)
+        for instance in (target, redirect):
+            threading.Thread(target=instance.serve_forever, daemon=True).start()
+        try:
+            candidate = {'base_url': 'http://127.0.0.1:%s' % redirect.server_port,
+                         'api_key': 'fake-secret', 'model': 'm', 'reasoner_model': 'm', 'timeout': 3}
+            with self.assertRaises(HTTPError):
+                server._chat_one(candidate, [{'role': 'user', 'content': 'hi'}], False)
+            with self.assertRaises(HTTPError):
+                list(server._chat_stream_one(candidate, [{'role': 'user', 'content': 'hi'}], None, {}))
+            self.assertEqual(Target.hits, 0)
+        finally:
+            for instance in (redirect, target):
+                instance.shutdown()
+                instance.server_close()
+
+    def test_archive_default_import_does_not_overwrite_concurrent_save(self):
+        import io
+        import zipfile
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+        (DATA / 'storage.json').unlink()
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr('storage.json', json.dumps({'sessions': [{'msgs': ['archive']}]}))
+        checked, started, finished = threading.Event(), threading.Event(), threading.Event()
+        real_read = server.read_storage
+        def paused_read():
+            result = real_read()
+            checked.set()
+            self.assertTrue(started.wait(3))
+            self.assertFalse(finished.wait(0.2))
+            return result
+        def write():
+            self.assertTrue(checked.wait(3))
+            started.set()
+            server.put_storage({'sessions': [{'msgs': ['live']}]})
+            finished.set()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with patch.object(server, 'read_storage', side_effect=paused_read):
+                writer = pool.submit(write)
+                imported = server.archive_import(buffer.getvalue(), False)
+                writer.result(timeout=4)
+        self.assertEqual(imported['storage'], 'restored')
+        self.assertEqual(real_read()['data']['sessions'][0]['msgs'], ['live'])
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

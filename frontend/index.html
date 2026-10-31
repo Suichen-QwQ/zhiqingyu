@@ -2217,9 +2217,11 @@
      只丢一段会话，永远好过丢全部。 */
   let cloudState='pending', cloudRevision=null, cloudBusy=false, cloudGeneration=0, cloudTracking=false;
   const cloudPendingPrefix='zqy-pending-';
+  let cloudRecoveryKey=null;
   const cloudTabId=(()=>{
-    try{let id=sessionStorage.getItem('zqy-tab-id');if(!id){id=Date.now().toString(36)+Math.random().toString(36).slice(2);sessionStorage.setItem('zqy-tab-id',id);}return id;}
-    catch(e){return Date.now().toString(36)+Math.random().toString(36).slice(2);}
+    const id=Date.now().toString(36)+Math.random().toString(36).slice(2);
+    try{const previous=sessionStorage.getItem('zqy-tab-id');if(previous)cloudRecoveryKey=cloudPendingPrefix+previous;sessionStorage.setItem('zqy-tab-id',id);}catch(e){}
+    return id;
   })();
   const cloudPendingKey=cloudPendingPrefix+cloudTabId;
   function cloudPendingRecords(){
@@ -2351,7 +2353,7 @@
   }
   function dbLoad(){
     let raw=null;
-    try{raw=localStorage.getItem(cloudPendingKey)||localStorage.getItem('zqy-data');}catch(e){}
+    try{raw=localStorage.getItem(cloudPendingKey)||(cloudRecoveryKey&&localStorage.getItem(cloudRecoveryKey))||localStorage.getItem('zqy-data');}catch(e){}
     if(!raw){ newSession(); return; }     /* 空开始：建 1 个空会话 */
     try{
       const o=JSON.parse(raw);
@@ -2368,6 +2370,14 @@
       const dia=(o.diary&&typeof o.diary==='object')?o.diary:{};
       DB.diary={};for(const k in dia){ if(dia[k]&&dia[k].seed) continue; DB.diary[k]=dia[k]; }
       DB.meta=(o.meta&&typeof o.meta==='object')?o.meta:{};
+      // Transfer a recovered snapshot to this document's unique key before
+      // releasing the old record; a copied page cannot clear our future edits.
+      try{
+        if(cloudRecoveryKey&&localStorage.getItem(cloudRecoveryKey)===raw){
+          localStorage.setItem(cloudPendingKey,raw);
+          if(localStorage.getItem(cloudRecoveryKey)===raw)localStorage.removeItem(cloudRecoveryKey);
+        }
+      }catch(e){}
       normalizeDB();                    /* 旧数据缺字段 → 补默认，避免渲染崩溃 */
       if(!DB.sessions.length) newSession();
       if(!DB.activeId) DB.activeId=DB.sessions[0].id;
@@ -5210,6 +5220,19 @@
         showToast('已导出 JSON 备份');
       }catch(e){ showToast('导出失败，请重试'); }
     });
+    function selectBackupData(backup,choose){
+      const primary=backup.db||backup;
+      const snapshots=Object.values(backup.pending_tabs||{}).filter(d=>d&&Array.isArray(d.sessions)&&d.diary&&typeof d.diary==='object');
+      if(!snapshots.length)return {data:primary,primary:true};
+      const lines=['0：主备份（'+(Array.isArray(primary.sessions)?primary.sessions.length:0)+' 个会话）'];
+      snapshots.forEach((d,i)=>lines.push((i+1)+'：待同步快照（'+d.sessions.length+' 个会话）'));
+      const choice=choose('选择要恢复的数据。待同步快照可分别导入；取消则不导入。\n'+lines.join('\n'),'0');
+      if(choice===null)return null;
+      if(!/^\d+$/.test(choice.trim()))throw new Error('invalid backup selection');
+      const index=Number(choice);
+      if(index<0||index>snapshots.length)throw new Error('invalid backup selection');
+      return {data:index===0?primary:snapshots[index-1],primary:index===0};
+    }
     const bkImport=document.getElementById('bkImport');
     if(bkImport) bkImport.addEventListener('click',function(){
       const input=document.createElement('input'); input.type='file'; input.accept='application/json';
@@ -5218,13 +5241,15 @@
         const reader=new FileReader();
         reader.onload=async function(){
           try{
-            const backup=JSON.parse(reader.result), data=backup.db||backup;
+            const backup=JSON.parse(reader.result), selected=selectBackupData(backup,window.prompt.bind(window));
+            if(!selected)return;
+            const data=selected.data;
             if(!Array.isArray(data.sessions)||!data.diary||typeof data.diary!=='object') throw new Error('format');
             const overwrite=await zqyConfirm({title:'确定覆盖本机对话、日记和设置吗？',body:'取消则合并导入。',ok:'覆盖导入',cancel:'合并导入'});
             if(overwrite){ DB.sessions=data.sessions; DB.diary=data.diary; DB.meta=data.meta||{}; DB.activeId=data.activeId; }
             else { DB.sessions=DB.sessions.concat(data.sessions.filter(s=>s&&s.id&&!DB.sessions.some(x=>x.id===s.id))); DB.diary=Object.assign({},DB.diary,data.diary); }
             profileId(); if(!DB.sessions.length) newSession(); if(!DB.sessions.some(s=>s.id===DB.activeId)) DB.activeId=DB.sessions[0].id;
-            const memOk=await memImport(backup,overwrite);   /* 优先 memory_v2，旧备份走 memory */
+            const memOk=selected.primary?await memImport(backup,overwrite):true;   /* 优先 memory_v2，旧备份走 memory */
             dbSave(); refreshView(); showToast(overwrite?'备份已恢复':'备份已合并');
             if(!memOk) showToast('对话已恢复，记忆没能一起恢复');
           }catch(e){ showToast('备份格式不正确，未导入'); }

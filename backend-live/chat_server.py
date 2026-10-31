@@ -2529,7 +2529,7 @@ def model_settings_from(data):
             'fallbacks': [e for e in (data.get('fallbacks') or []) if isinstance(e, dict)]}
 
 
-class _NoProbeRedirect(urllib.request.HTTPRedirectHandler):
+class _NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -2550,7 +2550,7 @@ def probe_model_call(base_url, api_key, model, timeout=15, want_chat=False):
     started = time.time()
     try:
         req = urllib.request.Request(base + '/models', headers=headers)
-        with urllib.request.build_opener(_NoProbeRedirect()).open(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(_NoCredentialRedirect()).open(req, timeout=timeout) as resp:
             raw = _resp_bytes(resp, 400000).decode('utf-8', 'replace')
         out['latency_ms'] = int((time.time() - started) * 1000)
         try:
@@ -2601,7 +2601,7 @@ def probe_model_call(base_url, api_key, model, timeout=15, want_chat=False):
         req = urllib.request.Request(base + '/chat/completions',
                                      data=json_dumps(payload, ensure_ascii=False).encode('utf-8'),
                                      headers=h2, method='POST')
-        with urllib.request.build_opener(_NoProbeRedirect()).open(req, timeout=timeout + 15) as resp:
+        with urllib.request.build_opener(_NoCredentialRedirect()).open(req, timeout=timeout + 15) as resp:
             json.loads(_resp_bytes(resp, 1 << 20).decode('utf-8', 'replace'))
         out['chat_ok'] = True
         out['chat_latency_ms'] = int((time.time() - started) * 1000)
@@ -3416,7 +3416,7 @@ def _chat_stream_one(cand, messages, tools, _result, think=False):
                'Authorization': 'Bearer ' + (cand.get('api_key') or '')}
 
     def _open(p):
-        return urllib.request.urlopen(urllib.request.Request(
+        return urllib.request.build_opener(_NoCredentialRedirect()).open(urllib.request.Request(
             url,
             data=json_dumps(p, ensure_ascii=False).encode('utf-8'),
             headers=headers, method='POST'), timeout=cand['timeout'])
@@ -3945,7 +3945,7 @@ def _chat_one(cand, messages, json_mode, max_tokens=2500, think=False, tools=Non
 
     def _open(p):
         body = json_dumps(p, ensure_ascii=False).encode('utf-8')
-        return urllib.request.urlopen(urllib.request.Request(
+        return urllib.request.build_opener(_NoCredentialRedirect()).open(urllib.request.Request(
             settings['base_url'] + '/chat/completions',
             data=body,
             headers={'Content-Type': 'application/json',
@@ -5711,15 +5711,6 @@ def _archive_write(path, text, force):
     return 'restored'
 
 
-def _storage_has_data():
-    try:
-        st = read_storage()
-        d = st.get('data') if isinstance(st, dict) else None
-    except Exception:
-        return False
-    return bool(d)
-
-
 def archive_import(blob, force=False):
     """解包导入。默认只补空缺，force=True 才覆盖（误覆盖线上记忆是不可接受的）。
 
@@ -5770,11 +5761,12 @@ def archive_import(blob, force=False):
                 if obj is None:
                     out['skipped'].append('storage.json（不是合法 JSON）')
                     continue
-                if not force and _storage_has_data():
-                    out['storage'] = 'skipped_has_data'
-                    continue
-                stamp = put_storage(obj)
-                out['storage'] = 'restored' if stamp else 'failed'
+                with STORAGE_LOCK:
+                    if not force and read_storage().get('data'):
+                        out['storage'] = 'skipped_has_data'
+                        continue
+                    stamp = put_storage(obj)
+                    out['storage'] = 'restored' if stamp else 'failed'
                 continue
             # memories/xxx.json 与 recall/xxx.json
             if extract_json_obj(text) is None:

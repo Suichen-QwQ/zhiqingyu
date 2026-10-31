@@ -1,0 +1,12 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const html=fs.readFileSync('frontend/index.html','utf8');
+const start=html.indexOf('    function selectBackupData('),end=html.indexOf("    const bkImport=",start);
+const ctx={};vm.createContext(ctx);vm.runInContext(html.slice(start,end)+'\nthis.select=selectBackupData',ctx);
+const primary={sessions:[{id:'primary'}],diary:{}},pending={sessions:[{id:'pending',msgs:[{id:'only-here'}]}],diary:{}};
+const backup={db:primary,pending_tabs:{tab:pending}};
+assert.equal(ctx.select(backup,()=> '1').data.sessions[0].msgs[0].id,'only-here');
+assert.equal(ctx.select(backup,()=> '0').data.sessions[0].id,'primary');
+assert.equal(ctx.select(backup,()=> null),null);
+assert.throws(()=>ctx.select(backup,()=> '9'));
+assert.equal(ctx.select({db:primary},()=>{throw Error('unexpected prompt')}).data,primary);
+console.log('pending snapshot backup selection regression passed');
