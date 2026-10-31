@@ -2499,6 +2499,11 @@ def model_settings_from(data):
             'fallbacks': [e for e in (data.get('fallbacks') or []) if isinstance(e, dict)]}
 
 
+class _NoProbeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def probe_model_call(base_url, api_key, model, timeout=15, want_chat=False):
     """后端发起一次试连：GET {base}/models，want_chat 时再补一次最小对话请求。
 
@@ -2515,7 +2520,7 @@ def probe_model_call(base_url, api_key, model, timeout=15, want_chat=False):
     started = time.time()
     try:
         req = urllib.request.Request(base + '/models', headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(_NoProbeRedirect()).open(req, timeout=timeout) as resp:
             raw = _resp_bytes(resp, 400000).decode('utf-8', 'replace')
         out['latency_ms'] = int((time.time() - started) * 1000)
         try:
@@ -2566,7 +2571,7 @@ def probe_model_call(base_url, api_key, model, timeout=15, want_chat=False):
         req = urllib.request.Request(base + '/chat/completions',
                                      data=json_dumps(payload, ensure_ascii=False).encode('utf-8'),
                                      headers=h2, method='POST')
-        with urllib.request.urlopen(req, timeout=timeout + 15) as resp:
+        with urllib.request.build_opener(_NoProbeRedirect()).open(req, timeout=timeout + 15) as resp:
             json.loads(_resp_bytes(resp, 1 << 20).decode('utf-8', 'replace'))
         out['chat_ok'] = True
         out['chat_latency_ms'] = int((time.time() - started) * 1000)
@@ -6177,13 +6182,43 @@ def transcribe_azure(wav_bytes, lang='zh-CN', rate=16000):
         return ''
 
 
+class RequestTooLarge(Exception):
+    pass
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _origin_allowed(self):
+        # Browser requests must be same-origin. Non-browser clients without Origin
+        # remain supported; public deployments must also use authentication.
+        origin = self.headers.get('Origin')
+        if not origin:
+            return self.headers.get('Sec-Fetch-Site', '').lower() != 'cross-site'
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+            host = (self.headers.get('Host') or '').lower()
+            return (parsed.scheme in ('http', 'https') and bool(host)
+                    and parsed.netloc.lower() == host
+                    and parsed.scheme == (self.headers.get('X-Forwarded-Proto') or 'http').lower()
+                    and not parsed.username
+                    and not parsed.password and not parsed.path
+                    and not parsed.query and not parsed.fragment)
+        except ValueError:
+            return False
+
     def do_POST(self):
+        if not self._origin_allowed():
+            self._send_error(403, 'cross-origin request denied')
+            return
         if not re.search(r'/api/(chat|memory|settings|storage|diary|transcribe|tts|recall'
                           r'|answer|archive|inbox)', self.path):
             self._send_error(404, 'not found')
             return
-        raw = self._read_body()
+        try:
+            raw = self._read_body()
+        except RequestTooLarge:
+            self.close_connection = True
+            self._send_error(413, 'request body too large')
+            return
         if not raw:
             self._send_error(400, 'empty body')
             return
@@ -6331,7 +6366,17 @@ class Handler(BaseHTTPRequestHandler):
             if re.search(r'/api/settings/test$', self.path):
                 settings = model_settings()
                 base = str(payload.get('base_url') or settings['base_url']).strip()
-                key = str(payload.get('api_key') or '').strip() or settings['api_key'] or API_KEY
+                key = str(payload.get('api_key') or '').strip()
+                if not key:
+                    if base.rstrip('/') == str(settings['base_url']).rstrip('/'):
+                        key = settings['api_key'] or API_KEY
+                    else:
+                        matches = [entry for entry in saved_fallbacks()
+                                   if base.rstrip('/') == str(entry['base_url']).rstrip('/')]
+                        if len(matches) != 1:
+                            self._send(400, {'error': 'API key required for a different base URL'})
+                            return
+                        key = matches[0]['api_key']
                 model = str(payload.get('model') or settings['model']).strip()
                 try:
                     probe_timeout = max(5, min(int(payload.get('timeout') or 15), 30))
@@ -6405,6 +6450,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(502, 'upstream LLM error: %s' % str(e))
 
     def do_GET(self):
+        if not self._origin_allowed():
+            self._send_error(403, 'cross-origin request denied')
+            return
         # 路径去掉 query string 后再匹配路由（否则 /api/memory?profile_id=x 匹配不到 /api/memory$）
         path_only = urllib.parse.urlparse(self.path).path
         # 健康检查
@@ -6466,8 +6514,13 @@ class Handler(BaseHTTPRequestHandler):
         if not rel or rel == 'index.html':
             rel = 'index.html'
         if rel.startswith('assets/') or rel == 'index.html':
-            path = os.path.join(STATIC_DIR, rel)
-            if os.path.isfile(path):
+            root = os.path.realpath(STATIC_DIR)
+            path = os.path.realpath(os.path.join(root, rel))
+            try:
+                inside = os.path.commonpath([root, path]) == root
+            except ValueError:
+                inside = False
+            if inside and os.path.isfile(path):
                 self._serve_file(path, rel)
                 return
         self._send_error(404, 'not found')
@@ -6505,9 +6558,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', ctype + '; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         # 同源反代其实用不到 CORS，但保留以支持直连/未来跨域
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         self.wfile.write(body)
@@ -6520,7 +6570,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'private, max-age=86400')
-        self.send_header('Access-Control-Allow-Origin', '*')
         if extra:
             for k, v in extra.items():
                 self.send_header(k, v)
@@ -6540,7 +6589,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Disposition',
                          'attachment; filename="%s"' % filename)
         self.send_header('Cache-Control', 'no-store')
-        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -6573,10 +6621,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_OPTIONS(self):
+        if not self._origin_allowed():
+            self._send_error(403, 'cross-origin request denied')
+            return
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Content-Length', '0')
         self.end_headers()
 
@@ -6592,6 +6640,8 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         if n <= 0:
             return b''
+        if n > ARCHIVE_MAX_BYTES:
+            raise RequestTooLarge()
         return self.rfile.read(n)
 
     def _read_chunked(self):
@@ -6614,6 +6664,8 @@ class Handler(BaseHTTPRequestHandler):
                     if t in (b'\r\n', b'\n', b''):
                         break
                 break
+            if size < 0 or len(data) + size > ARCHIVE_MAX_BYTES:
+                raise RequestTooLarge()
             data += self.rfile.read(size)
             self.rfile.read(2)  # chunk 末尾的 CRLF
         return data

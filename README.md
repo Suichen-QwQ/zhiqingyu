@@ -21,3 +21,9 @@ python local-run.py --demo
 - `scripts/`：本地启动和依赖安装脚本。
 
 不要将 API 密钥、用户数据、数据库或运行环境文件提交到公开仓库。
+
+## 部署安全
+
+本服务面向单用户使用。公网部署必须在反向代理前启用身份验证和 HTTPS；后端默认只监听本机。`backend-live/nginx-zhiqingyu.conf` 示例要求使用 `/etc/nginx/zhiqingyu.htpasswd`，部署前请使用 `htpasswd` 创建密码文件，配置 HTTPS，再检查并重载 nginx。不要将后端端口直接暴露到公网。
+
+模型连接测试仅在地址与已保存配置一致时复用该地址的密钥；测试新地址时须输入对应密钥。
