@@ -58,6 +58,7 @@ MEMORY_FILE = os.environ.get('ZQY_MEMORY_FILE', os.path.join(SERVER_DIR, 'memory
 MEM_LOCK = threading.RLock()
 MEMORY_DIR = os.environ.get('ZQY_MEMORY_DIR', os.path.join(SERVER_DIR, 'memories'))
 SETTINGS_FILE = os.environ.get('ZQY_SETTINGS_FILE', os.path.join(SERVER_DIR, 'settings.json'))
+SETTINGS_LOCK = threading.RLock()
 # 云端数据：对话/日记/设置的整包 JSON（单用户全局，跨设备 + 清浏览器后可从云端恢复）
 STORAGE_FILE = os.environ.get('ZQY_STORAGE_FILE', os.path.join(SERVER_DIR, 'storage', 'zqy-data.json'))
 # 静态托管根：项目根目录（index.html 所在处）
@@ -2233,8 +2234,9 @@ def _read_memory():
 def _saved_settings():
     """只读 settings.json（不含 .env 默认值），用于区分 Key 来源。"""
     try:
-        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
+        with SETTINGS_LOCK:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
         return saved if isinstance(saved, dict) else {}
     except Exception:
         return {}
@@ -2248,18 +2250,10 @@ def model_settings():
     defaults = {'base_url': BASE_URL, 'model': MODEL,
                 'reasoner_model': REASONER_MODEL, 'timeout': 60,
                 'api_key': API_KEY}
-    saved = {}
-    try:
-        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-            saved = json.load(f)
-        if isinstance(saved, dict):
-            for key in defaults:
-                if saved.get(key):
-                    defaults[key] = saved[key]
-    except Exception:
-        pass
-    if not isinstance(saved, dict):
-        saved = {}
+    saved = _saved_settings()
+    for key in defaults:
+        if saved.get(key):
+            defaults[key] = saved[key]
     if defaults['base_url'].rstrip('/') != BASE_URL.rstrip('/') and not str(saved.get('api_key') or '').strip():
         defaults['api_key'] = ''
     defaults['base_url'] = str(defaults['base_url']).rstrip('/')
@@ -2359,6 +2353,11 @@ def merge_fallbacks(raw_list):
 
 
 def model_chain():
+    with SETTINGS_LOCK:
+        return _model_chain_locked()
+
+
+def _model_chain_locked():
     """本次请求按顺序尝试的模型：[首选, 备用1, 备用2…]，每项是一个完整网关配置。
 
     备用项没配自己的 Key → 沿用首选那把（同一网关换模型是常见情形）。
@@ -2484,10 +2483,16 @@ def public_settings(settings=None):
 
 
 def save_model_settings(data):
+    with SETTINGS_LOCK:
+        return _save_model_settings_locked(data)
+
+
+def _save_model_settings_locked(data):
     """保存模型设置。api_key 语义：非空=替换；clear_key=true=清除；
     缺省或空串=保持原样（前端不会因为回显不了明文而误清 Key）。
     """
     current = model_settings()
+    current['fallbacks'] = saved_fallbacks()
     requested_base = str(data.get('base_url') or current['base_url']).strip().rstrip('/')
     if requested_base != current['base_url'] and not str(data.get('api_key') or '').strip():
         raise ValueError('A new API key is required when changing the model service address')
@@ -2501,17 +2506,27 @@ def save_model_settings(data):
     if 'fallbacks' in data:
         current['fallbacks'] = merge_fallbacks(data.get('fallbacks'))
     current = model_settings_from(current)
+    tmp = None
     try:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        import tempfile
+        directory = os.path.dirname(os.path.abspath(SETTINGS_FILE))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.zqy-settings-', suffix='.tmp', dir=directory)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            os.chmod(tmp, 0o600)
             json_dump(current, f, ensure_ascii=False, indent=2)
-        try:
-            os.chmod(SETTINGS_FILE, 0o600)   # 里面可能有 Key，收权限
-        except Exception:
-            pass
-        # 回给前端的是「清文件后重新解析」的结果：清 Key 后实际生效的是 .env 里那把
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SETTINGS_FILE)
         return public_settings()
     except Exception:
         return None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def model_settings_from(data):
@@ -6212,6 +6227,15 @@ class RequestTooLarge(Exception):
     pass
 
 
+class BadRequestBody(Exception):
+    pass
+
+
+REQUEST_METADATA_MAX = 64 * 1024
+REQUEST_CHUNK_LINE_MAX = 8192
+REQUEST_BODY_TIMEOUT = 30
+
+
 class Handler(BaseHTTPRequestHandler):
     def _origin_allowed(self):
         # Browser requests must be same-origin. Non-browser clients without Origin
@@ -6254,6 +6278,14 @@ class Handler(BaseHTTPRequestHandler):
         except RequestTooLarge:
             self.close_connection = True
             self._send_error(413, 'request body too large')
+            return
+        except (socket.timeout, TimeoutError):
+            self.close_connection = True
+            self._send_error(408, 'request body timed out')
+            return
+        except BadRequestBody as e:
+            self.close_connection = True
+            self._send_error(400, str(e))
             return
         if not raw:
             self._send_error(400, 'empty body')
@@ -6666,46 +6698,82 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _read_body(self):
-        # 兼容浏览器 fetch 的 Transfer-Encoding:chunked（无 Content-Length）
-        te = (self.headers.get('Transfer-Encoding') or '').lower()
-        if 'chunked' in te:
-            return self._read_chunked()
-        n = 0
+        previous = self.connection.gettimeout()
+        self._request_deadline = time.monotonic() + REQUEST_BODY_TIMEOUT
         try:
-            n = int(self.headers.get('Content-Length', 0) or 0)
-        except ValueError:
-            n = 0
-        if n <= 0:
-            return b''
-        if n > ARCHIVE_MAX_BYTES:
-            raise RequestTooLarge()
-        return self.rfile.read(n)
+            te = (self.headers.get('Transfer-Encoding') or '').lower()
+            if te:
+                if te != 'chunked' or self.headers.get('Content-Length') is not None:
+                    raise BadRequestBody('invalid transfer encoding')
+                return self._read_chunked()
+            try:
+                n = int(self.headers.get('Content-Length', 0) or 0)
+            except ValueError:
+                raise BadRequestBody('invalid content length')
+            if n < 0:
+                raise BadRequestBody('invalid content length')
+            if n > ARCHIVE_MAX_BYTES:
+                raise RequestTooLarge()
+            return self._request_read_exact(n)
+        finally:
+            self.connection.settimeout(previous)
+
+    def _request_timeout(self):
+        remaining = self._request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout('request deadline exceeded')
+        self.connection.settimeout(remaining)
+
+    def _request_read_exact(self, size):
+        parts = []
+        remaining = size
+        while remaining:
+            self._request_timeout()
+            part = self.rfile.read1(min(remaining, 65536))
+            if not part:
+                raise BadRequestBody('incomplete request body')
+            parts.append(part)
+            remaining -= len(part)
+        return b''.join(parts)
+
+    def _request_chunk_line(self, budget):
+        line = bytearray()
+        while True:
+            line.extend(self._request_read_exact(1))
+            if len(line) > REQUEST_CHUNK_LINE_MAX or len(line) > budget:
+                raise RequestTooLarge()
+            if line[-1:] == b'\n':
+                if not line.endswith(b'\r\n'):
+                    raise BadRequestBody('invalid chunk line ending')
+                return bytes(line)
 
     def _read_chunked(self):
-        data = b''
+        data = bytearray()
+        metadata = 0
         while True:
-            line = self.rfile.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                size = int(line.split(b';')[0].strip(), 16)
-            except ValueError:
-                break
+            line = self._request_chunk_line(REQUEST_METADATA_MAX - metadata)
+            metadata += len(line)
+            token = line[:-2].split(b';', 1)[0]
+            if not re.fullmatch(b'[0-9a-fA-F]+', token):
+                raise BadRequestBody('invalid chunk size')
+            size = int(token, 16)
             if size == 0:
-                # 结束：吞掉 trailer 直到空行
                 while True:
-                    t = self.rfile.readline()
-                    if t in (b'\r\n', b'\n', b''):
-                        break
-                break
-            if size < 0 or len(data) + size > ARCHIVE_MAX_BYTES:
+                    trailer = self._request_chunk_line(REQUEST_METADATA_MAX - metadata)
+                    metadata += len(trailer)
+                    if trailer == b'\r\n':
+                        return bytes(data)
+                    if b':' not in trailer[:-2]:
+                        raise BadRequestBody('invalid chunk trailer')
+            if len(data) + size > ARCHIVE_MAX_BYTES:
                 raise RequestTooLarge()
-            data += self.rfile.read(size)
-            self.rfile.read(2)  # chunk 末尾的 CRLF
-        return data
+            data.extend(self._request_read_exact(size))
+            metadata += 2
+            if metadata > REQUEST_METADATA_MAX:
+                raise RequestTooLarge()
+            if self._request_read_exact(2) != b'\r\n':
+                raise BadRequestBody('invalid chunk delimiter')
+
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True

@@ -221,6 +221,81 @@ class SecurityTests(unittest.TestCase):
             with self.assertRaises(server.LLMError):
                 list(server._chat_stream_one(candidate, [], None, {}))
 
+    def test_settings_partial_update_preserves_fallback_keys(self):
+        server.save_model_settings({'fallbacks': [{'base_url': server.BASE_URL, 'model': 'backup', 'api_key': 'fake-backup'}]})
+        server.save_model_settings({'timeout': 30})
+        self.assertEqual(server.saved_fallbacks()[0]['api_key'], 'fake-backup')
+        server.save_model_settings({'clear_key': True})
+        self.assertEqual(server.saved_fallbacks()[0]['model'], 'backup')
+        server.save_model_settings({'fallbacks': []})
+        self.assertEqual(server.saved_fallbacks(), [])
+
+    def test_settings_file_stays_valid_until_atomic_replacement(self):
+        from unittest.mock import patch
+        server.save_model_settings({'base_url': 'https://custom.example/v1', 'api_key': 'fake-custom'})
+        original = (DATA / 'settings.json').read_bytes()
+        dump = server.json_dump
+        def while_writing(*args, **kwargs):
+            self.assertEqual((DATA / 'settings.json').read_bytes(), original)
+            self.assertEqual(server.model_settings()['base_url'], 'https://custom.example/v1')
+            return dump(*args, **kwargs)
+        with patch.object(server, 'json_dump', side_effect=while_writing):
+            self.assertTrue(server.save_model_settings({'timeout': 31}))
+        self.assertEqual(server.model_settings()['timeout'], 31)
+        self.assertEqual(list(DATA.glob('.zqy-settings-*.tmp')), [])
+        with patch.object(server.os, 'replace', side_effect=OSError('test failure')):
+            self.assertIsNone(server.save_model_settings({'timeout': 32}))
+        self.assertEqual(server.model_settings()['timeout'], 31)
+        self.assertEqual(list(DATA.glob('.zqy-settings-*.tmp')), [])
+
+    def test_concurrent_partial_settings_updates_are_serialized(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(server.save_model_settings, payload) for payload in
+                       ({'timeout': 37}, {'model': 'updated-model'})]
+            self.assertTrue(all(f.result() for f in futures))
+        self.assertEqual(server.model_settings()['timeout'], 37)
+        self.assertEqual(server.model_settings()['model'], 'updated-model')
+
+    def chunk_request(self, raw):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=4)
+        try:
+            conn.putrequest('POST', '/api/storage')
+            conn.putheader('Transfer-Encoding', 'chunked')
+            conn.endheaders()
+            conn.send(raw)
+            response = conn.getresponse()
+            status, body = response.status, response.read()
+            return status, body
+        finally:
+            conn.close()
+
+    def test_chunk_metadata_limits(self):
+        from unittest.mock import patch
+        self.assertEqual(self.chunk_request(b'1;' + b'x'*8192 + b'\r\nx\r\n0\r\n\r\n')[0], 413)
+        with patch.object(server, 'REQUEST_METADATA_MAX', 64):
+            self.assertEqual(self.chunk_request((b'1;abcdefghij\r\nx\r\n')*6+b'0\r\n\r\n')[0], 413)
+            self.assertEqual(self.chunk_request(b'0\r\n'+b'X-Test: '+b'x'*60+b'\r\n\r\n')[0], 413)
+        self.assertEqual(self.chunk_request(b'nohex\r\n')[0], 400)
+        self.assertEqual(self.chunk_request(b'1\r\nxXX0\r\n\r\n')[0], 400)
+        # Valid chunking still reaches the storage revision check.
+        self.assertEqual(self.chunk_request(b'2;test=ok\r\n{}\r\n0\r\nX-Test: ok\r\n\r\n')[0], 428)
+
+    def test_chunk_read_deadline(self):
+        from unittest.mock import patch
+        with patch.object(server, 'REQUEST_BODY_TIMEOUT', 0.1):
+            conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+            try:
+                conn.putrequest('POST', '/api/storage')
+                conn.putheader('Transfer-Encoding', 'chunked')
+                conn.endheaders()
+                conn.send(b'1;unfinished')
+                response = conn.getresponse()
+                self.assertEqual(response.status, 408)
+                response.read()
+            finally:
+                conn.close()
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

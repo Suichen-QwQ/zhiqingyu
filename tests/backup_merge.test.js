@@ -10,3 +10,14 @@ assert(merged.diary.day.manual.includes('local diary')&&merged.diary.day.manual.
 assert.equal(merged.meta.name,'local');assert.equal(merged.meta.voice,'v');
 const again=c.merge(merged,incoming,()=> 'copy'+(++id));assert.equal(again.sessions.length,merged.sessions.length);assert.equal(again.sessions[0].msgs.length,merged.sessions[0].msgs.length);
 assert.equal(local.sessions[0].msgs.length,2);console.log('same-session messages, edit conflicts and repeated backup merge passed');
+
+const m1={id:'m1',role:'me',text:'first',ts:1},r1={id:'r1',role:'ai',text:'reply',ts:2},m2={id:'m2',role:'me',text:'middle',ts:3},r2={id:'r2',role:'ai',text:'middle reply',ts:4},m3={id:'m3',role:'me',text:'last',ts:5};
+const restore=c.merge({sessions:[{id:'s',msgs:[m1,r1,m3]}],diary:{}},{sessions:[{id:'s',msgs:[m1,r1,m2,r2,m3]}],diary:{}},()=> 'copy');
+assert.equal(restore.sessions[0].msgs.map(x=>x.id).join(','),'m1,r1,m2,r2,m3');
+const noAnchor=c.merge({sessions:[{id:'s',msgs:[m3]}],diary:{}},{sessions:[{id:'s',msgs:[m1,r1]}],diary:{}},()=> 'copy');
+assert.equal(noAnchor.sessions[0].msgs.map(x=>x.id).join(','),'m1,r1,m3');
+const clockSkew=c.merge({sessions:[{id:'s',msgs:[{...m1,ts:100},r1,m3]}],diary:{}},{sessions:[{id:'s',msgs:[{...m1,ts:100},r1,m2,r2,m3]}],diary:{}},()=> 'copy');
+assert.equal(clockSkew.sessions[0].msgs.map(x=>x.id).join(','),'m1,r1,m2,r2,m3');
+const incompatible=c.merge({sessions:[{id:'s',msgs:[m1,r1,m3]}],diary:{}},{sessions:[{id:'s',msgs:[m3,m1,r1]}],diary:{}},()=> 'order-copy');
+assert.equal(incompatible.sessions[0].msgs.map(x=>x.id).join(','),'m1,r1,m3');assert(incompatible.sessions.some(s=>s.backupOf==='s'&&s.msgs[0].id==='m3'));
+console.log('historical message ordering, reply sequence and order conflicts passed');

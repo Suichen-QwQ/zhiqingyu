@@ -5238,17 +5238,52 @@
     function mergeBackupData(local,incoming,makeId){
       const clone=v=>JSON.parse(JSON.stringify(v));
       const sessions=clone(local.sessions||[]);
+      function orderMessages(existing,imported){
+        const nodes=new Map(),rank=new Map(),edges=new Map(),degree=new Map();
+        for(const m of existing.concat(imported))if(m&&m.id&&!nodes.has(m.id)){
+          rank.set(m.id,rank.size);nodes.set(m.id,m);edges.set(m.id,new Set());degree.set(m.id,0);
+        }
+        const positions=new Map(existing.filter(m=>m&&m.id).map((m,i)=>[m.id,i]));
+        let previous=-1,orderConflict=false;
+        for(const m of imported)if(m&&positions.has(m.id)){
+          const at=positions.get(m.id);if(at<previous)orderConflict=true;previous=at;
+        }
+        function addSequence(list){
+          let before=null;const seen=new Set();
+          for(const m of list){
+            if(!m||!nodes.has(m.id)||seen.has(m.id))continue;seen.add(m.id);
+            if(before!==null&&before!==m.id&&!edges.get(before).has(m.id)){
+              edges.get(before).add(m.id);degree.set(m.id,degree.get(m.id)+1);
+            }
+            before=m.id;
+          }
+        }
+        addSequence(existing);
+        // Incompatible order is preserved in a separate backup session.
+        if(!orderConflict)addSequence(imported);
+        const ready=Array.from(nodes.keys()).filter(id=>degree.get(id)===0),ordered=[];
+        const compare=(a,b)=>{
+          const ta=Number(nodes.get(a).ts),tb=Number(nodes.get(b).ts);
+          if(Number.isFinite(ta)&&ta>0&&Number.isFinite(tb)&&tb>0&&ta!==tb)return ta-tb;
+          return rank.get(a)-rank.get(b);
+        };
+        while(ready.length){
+          ready.sort(compare);const id=ready.shift();ordered.push(nodes.get(id));
+          for(const next of edges.get(id)){degree.set(next,degree.get(next)-1);if(!degree.get(next))ready.push(next);}
+        }
+        return {messages:ordered,orderConflict};
+      }
       for(const source of incoming.sessions||[]){
         if(!source||!source.id)continue;
         const target=sessions.find(s=>s.id===source.id);
         if(!target){sessions.push(clone(source));continue;}
         const original=new Map((target.msgs||[]).map(m=>[m.id,m]));
-        const conflict=(source.msgs||[]).some(m=>original.has(m.id)&&JSON.stringify(original.get(m.id))!==JSON.stringify(m));
+        const ordered=orderMessages(target.msgs||[],source.msgs||[]);
+        const conflict=ordered.orderConflict||(source.msgs||[]).some(m=>original.has(m.id)&&JSON.stringify(original.get(m.id))!==JSON.stringify(m));
         if(conflict&&!sessions.some(s=>s.backupOf===source.id&&JSON.stringify(s.msgs)===JSON.stringify(source.msgs))){
           const copy=clone(source);copy.id=makeId();copy.backupOf=source.id;copy.title=(copy.title||'对话')+'（备份冲突副本）';sessions.push(copy);
         }
-        target.msgs=target.msgs||[];
-        for(const message of source.msgs||[])if(!original.has(message.id)){target.msgs.push(clone(message));original.set(message.id,message);}
+        target.msgs=clone(ordered.messages);
         target.updated=Math.max(Number(target.updated)||0,Number(source.updated)||0);
       }
       const diary=clone(local.diary||{});
