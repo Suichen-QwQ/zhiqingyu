@@ -316,6 +316,36 @@ class SecurityTests(unittest.TestCase):
         self.assertIn('live memory', path.read_text())
         self.assertEqual(list(path.parent.glob('.zqy-import-*.tmp')), [])
 
+    def test_upstream_plain_and_gzip_size_limits(self):
+        import io
+        import gzip
+        class Response(io.BytesIO):
+            headers = {}
+        self.assertEqual(server._resp_bytes(Response(b'valid'), limit=8), b'valid')
+        self.assertEqual(server._resp_bytes(Response(gzip.compress(b'valid')), limit=64), b'valid')
+        with self.assertRaises(server.LLMError):
+            server._resp_bytes(Response(b'x'*65), limit=64)
+        with self.assertRaises(server.LLMError):
+            server._resp_bytes(Response(gzip.compress(b'x'*4096)), limit=64)
+        with self.assertRaises(server.LLMError):
+            server._resp_bytes(Response(b'\x1f\x8bbroken'), limit=64)
+
+    def test_stream_response_line_and_total_limits(self):
+        import io
+        import gzip
+        from unittest.mock import patch
+        class Response(io.BytesIO):
+            headers = {}
+        with patch.object(server, 'MODEL_RESPONSE_MAX', 64), patch.object(server, 'MODEL_LINE_MAX', 16):
+            self.assertEqual(list(server._iter_resp_lines(Response(b'data: ok\n\n'))), ['data: ok', ''])
+            self.assertEqual(list(server._iter_resp_lines(Response(gzip.compress(b'data: ok\n\n')))), ['data: ok', ''])
+            with self.assertRaises(server.LLMError):
+                list(server._iter_resp_lines(Response(b'x'*17+b'\n')))
+            with self.assertRaises(server.LLMError):
+                list(server._iter_resp_lines(Response(b'line\n'*14)))
+            with self.assertRaises(server.LLMError):
+                list(server._iter_resp_lines(Response(gzip.compress(b'line\n'*100))))
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

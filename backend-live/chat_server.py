@@ -2064,55 +2064,50 @@ def _err_text(e, limit=160):
     return ('%s: %s' % (type(e).__name__, str(e))).strip()[:limit]
 
 
-def _resp_bytes(resp, limit=1 << 22, head=b''):
-    """读响应体并按需解压（部分网关节点不声明 Content-Encoding 就直接 gzip）。
+MODEL_RESPONSE_MAX = 8 * 1024 * 1024
+MODEL_LINE_MAX = 256 * 1024
 
-    head：调用方为「首字看门狗」预先读走的字节，必须拼回来，
-    否则 gzip 魔数判定会错位、整段解压失败。
-    """
-    raw = head + resp.read(limit)
+
+def _resp_bytes(resp, limit=1 << 22, head=b''):
+    """Bound both compressed input and expanded response bytes."""
+    raw = head + resp.read(max(0, limit + 1 - len(head)))
+    if len(raw) > limit:
+        raise LLMError('upstream: response exceeds size limit')
     if raw[:2] == b'\x1f\x8b' or 'gzip' in (resp.headers.get('Content-Encoding') or '').lower():
         try:
-            return gzip.decompress(raw)
-        except Exception:
-            return raw
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+                expanded = compressed.read(limit + 1)
+        except (OSError, EOFError):
+            raise LLMError('upstream: invalid gzip response')
+        if len(expanded) > limit:
+            raise LLMError('upstream: expanded response exceeds size limit')
+        return expanded
     return raw
 
 
 def _iter_resp_lines(resp, full_timeout=None):
-    """按行产出响应体文本（未压缩时保持逐字流式，压缩时整段解压后按行产出）。
-
-    ⚠️ 网关有的节点会「不声明 Content-Encoding 就直接 gzip」→ 按文本读全是乱码、
-    一个 delta 都解析不到，表现成「模型一个字都没说」。这里必须先认出 gzip。
-    """
-    head = b''
-    try:
-        head = resp.read(2)          # 只预读 2 字节，未压缩时不影响流式
-    except (socket.timeout, TimeoutError):
-        # 超时必须原样上抛：这里吞掉的话，后面的 readline() 会立刻返回空、
-        # 生成器「正常」结束，首字超时就被误判成「上游没给数据」，
-        # 首字看门狗等于白装（实测踩过）。
-        raise
-    except Exception:
-        pass
-    # 首个字节真的到达了才把超时从「首字窗口」调回长值，否则长回复会被拦腰截断。
-    # 注意条件是 head：一个字节都没到就【必须】保持短窗口 —— 否则下面 readline()
-    # 会按长超时干等，首字看门狗等于失效。
+    """Read SSE with bounded lines, total input and gzip expansion."""
+    head = resp.read(2)
     if full_timeout and head:
         _set_resp_timeout(resp, full_timeout)
     enc = (resp.headers.get('Content-Encoding') or '').lower()
     if head[:2] == b'\x1f\x8b' or 'gzip' in enc:
-        try:
-            blob = gzip.decompress(head + resp.read())
-        except Exception as e:
-            raise LLMError('upstream: gzip 解压失败 %s' % str(e)[:80])
-        for line in blob.decode('utf-8', 'replace').splitlines():
-            yield line.strip()
+        blob = _resp_bytes(resp, MODEL_RESPONSE_MAX, head=head)
+        for line in blob.splitlines():
+            if len(line) > MODEL_LINE_MAX:
+                raise LLMError('upstream: response line exceeds size limit')
+            yield line.decode('utf-8', 'replace').strip()
         return
-    first = head + resp.readline()
-    if first:
-        yield first.decode('utf-8', 'replace').strip()
-    for raw in resp:
+    total = 0
+    prefix = head
+    while True:
+        raw = prefix + resp.readline(MODEL_LINE_MAX + 1 - len(prefix))
+        prefix = b''
+        if not raw:
+            return
+        total += len(raw)
+        if len(raw) > MODEL_LINE_MAX or total > MODEL_RESPONSE_MAX:
+            raise LLMError('upstream: stream exceeds size limit')
         yield raw.decode('utf-8', 'replace').strip()
 
 
@@ -2924,8 +2919,8 @@ def _qianfan_search(query, n=3):
                  'Authorization': 'Bearer ' + QIANFAN_API_KEY},
         method='POST')
     try:
-        with urllib.request.urlopen(req, timeout=QIANFAN_TIMEOUT) as r:
-            data = json.loads(r.read().decode('utf-8'))
+        with urllib.request.build_opener(_NoCredentialRedirect()).open(req, timeout=QIANFAN_TIMEOUT) as r:
+            data = json.loads(_resp_bytes(r, 2 * 1024 * 1024).decode('utf-8'))
     except Exception:
         return []
     out = []
@@ -2953,7 +2948,7 @@ def _tavily_search(query, n=3):
         headers={'Content-Type': 'application/json'}, method='POST')
     try:
         with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT) as r:
-            data = json.loads(r.read().decode('utf-8'))
+            data = json.loads(_resp_bytes(r, 2 * 1024 * 1024).decode('utf-8'))
     except Exception:
         return []
     out = []
@@ -2972,7 +2967,7 @@ def _tavily_search(query, n=3):
 def _fetch(url, timeout=SEARCH_TIMEOUT):
     req = urllib.request.Request(url, headers=_SEARCH_HDR)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode('utf-8', 'replace')
+        return _resp_bytes(r, 2 * 1024 * 1024).decode('utf-8', 'replace')
 
 
 def _html_unescape(s):
@@ -3116,8 +3111,8 @@ def _deepseek_search(query, n, settings):
                                  headers={'Authorization': 'Bearer ' + key,
                                           'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(req, timeout=min(SEARCH_BUDGET, settings.get('timeout', 60))) as response:
-            data = json.loads(response.read(2 * 1024 * 1024).decode('utf-8'))
+        with urllib.request.build_opener(_NoCredentialRedirect()).open(req, timeout=min(SEARCH_BUDGET, settings.get('timeout', 60))) as response:
+            data = json.loads(_resp_bytes(response, 2 * 1024 * 1024).decode('utf-8'))
         out = []
         for item in (data.get('results') or []):
             if not isinstance(item, dict):
@@ -6145,12 +6140,12 @@ def tts_synth_chunk(text, voice=None, rate=None):
     req.add_header('X-Microsoft-OutputFormat', TTS_OUTPUT_FORMAT)
     req.add_header('User-Agent', 'zhiqingyu-tts')
     try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            data = r.read()
+        with urllib.request.build_opener(_NoCredentialRedirect()).open(req, timeout=25) as r:
+            data = _resp_bytes(r, MODEL_RESPONSE_MAX)
     except urllib.error.HTTPError as e:
         detail = ''
         try:
-            detail = e.read()[:300].decode('utf-8', 'replace')
+            detail = e.read(300).decode('utf-8', 'replace')
         except Exception:
             pass
         raise TTSError(u'语音合成失败（HTTP %s）' % e.code, detail)
@@ -6218,8 +6213,8 @@ def transcribe_azure(wav_bytes, lang='zh-CN', rate=16000):
     req.add_header('Ocp-Apim-Subscription-Key', key)
     req.add_header('Content-Type', 'audio/wav; codecs=audio/pcm; samplerate=%d' % rate)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read().decode('utf-8'))
+        with urllib.request.build_opener(_NoCredentialRedirect()).open(req, timeout=30) as r:
+            data = json.loads(_resp_bytes(r, 2 * 1024 * 1024).decode('utf-8'))
         text = data.get('DisplayText') or data.get('text') or ''
         return text.strip()
     except Exception as e:
