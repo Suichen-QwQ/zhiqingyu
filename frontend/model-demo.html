@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#F4F1EA">
+<title>栀情屿 · 自定义模型调用设置（演示）</title>
+<style>
+  :root{
+    --bg:#F4F1EA; --surface:#FFFFFF; --surface-2:#EEF3F7;
+    --mist:#7BA7C4; --mist-deep:#4A6B84; --mist-faint:#E3EDF4;
+    --ink:#3A4046; --ink-2:#7A828A; --ink-3:#A6ADB3;
+    --warm:#E8C07A; --line:#E4E0D6; --radius:18px; --ocher:#A07840;
+    --font:"HarmonyOS Sans SC","MiSans","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--ink);font-family:var(--font);-webkit-font-smoothing:antialiased;line-height:1.7}
+  .wrap{max-width:560px;margin:0 auto;padding:26px 20px calc(40px + env(safe-area-inset-bottom))}
+  .demo-note{display:flex;gap:9px;align-items:flex-start;font-size:12px;line-height:1.7;color:var(--mist-deep);
+    background:var(--mist-faint);border-radius:12px;padding:11px 13px;margin-bottom:16px}
+  .demo-note svg{flex:none;margin-top:2px}
+  .p-panel{width:100%;background:var(--surface);border:1px solid var(--line);border-radius:20px;
+    padding:22px 24px;box-shadow:0 18px 50px rgba(28,34,40,.10)}
+  .p-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+  .p-head h3{font-size:17px;font-weight:500}
+  .p-x{width:30px;height:30px;border:1px solid var(--line);border-radius:50%;background:none;color:var(--ink-2);
+    cursor:pointer;display:flex;align-items:center;justify-content:center;transition:color .2s,border-color .2s}
+  .p-x:hover{color:var(--ink);border-color:var(--mist)}
+  .set-tabs{display:flex;gap:2px;margin:12px 0 14px;border-bottom:1px solid var(--line);
+    overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+  .set-tabs::-webkit-scrollbar{display:none}
+  .set-tab{flex:none;background:none;border:none;font-family:inherit;font-size:13px;color:var(--ink-3);
+    padding:0 12px 9px;cursor:pointer;position:relative;letter-spacing:.04em;white-space:nowrap;transition:color .2s}
+  .set-tab:hover{color:var(--ink-2)}
+  .set-tab.on{color:var(--mist-deep);font-weight:500}
+  .set-tab.on::after{content:'';position:absolute;left:10px;right:10px;bottom:-1px;height:2px;background:var(--mist);border-radius:2px}
+  .p-sub{font-size:12.5px;color:var(--ink-3);line-height:1.6;margin-bottom:12px}
+  .p-field{display:block;font-size:12.5px;color:var(--ink-2);margin:14px 0 6px}
+  .p-field .f-badge{float:right;font-size:10.5px;color:var(--mist-deep);background:var(--mist-faint);
+    border-radius:999px;padding:1px 8px;letter-spacing:.03em}
+  .p-in,.p-ta{width:100%;font-family:inherit;font-size:13.5px;line-height:1.7;color:var(--ink);
+    background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:9px 12px;outline:none;
+    transition:border-color .2s;box-sizing:border-box}
+  .p-in:focus,.p-ta:focus{border-color:var(--mist)}
+  .p-in::placeholder{color:var(--ink-3)}
+  .p-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px;align-items:center}
+  .p-btn{font-family:inherit;font-size:13px;letter-spacing:.05em;padding:9px 22px;border-radius:999px;
+    cursor:pointer;transition:opacity .2s,background .2s,border-color .2s,color .2s}
+  .p-reset{background:none;border:1px solid var(--line);color:var(--ink-3)}
+  .p-reset:hover{color:var(--ink-2);border-color:var(--ink-3)}
+  .p-save{background:var(--mist-deep);border:none;color:#F7F9FA}
+  .p-save:hover{opacity:.88}
+  .p-save[disabled]{opacity:.5;cursor:default}
+  .p-sep{margin:18px 0 12px;border-top:1px dashed var(--line);height:0}
+  /* 服务商预设 */
+  .md-presets{display:flex;flex-wrap:wrap;gap:8px}
+  .p-opt{display:inline-flex;align-items:center;gap:6px;background:var(--surface);border-radius:999px;
+    border:1px solid var(--line);color:var(--ink-2);font-family:inherit;font-size:11.5px;
+    letter-spacing:.03em;padding:5px 11px;cursor:pointer;transition:background .2s,border-color .2s,color .2s}
+  .p-opt:hover{border-color:#BFD3E4}
+  .p-opt[data-on="1"]{background:rgba(122,158,184,.13);border-color:var(--mist-deep);color:var(--mist-deep)}
+  /* API Key 行 */
+  .md-key{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--bg);
+    border:1px solid var(--line);border-radius:10px;font-size:13px;color:var(--ink)}
+  .md-key[hidden]{display:none}
+  .md-key .mk-dot{width:7px;height:7px;border-radius:50%;background:var(--mist);flex:none}
+  .md-key .mk-txt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;color:var(--ink-2)}
+  .md-key .mk-txt code{font-family:inherit;color:var(--ink);letter-spacing:.06em}
+  .mk-b{font-family:inherit;font-size:11.5px;color:var(--mist-deep);background:none;border:1px solid var(--line);
+    border-radius:999px;padding:3px 10px;cursor:pointer;transition:all .2s;white-space:nowrap}
+  .mk-b:hover{border-color:var(--mist-deep)}
+  .mk-b.bad{color:#B3666A}
+  .mk-b.bad:hover{border-color:#B3666A}
+  .md-key-in{position:relative}
+  .md-key-in[hidden]{display:none}
+  .md-key-in .p-in{padding-right:42px;letter-spacing:.04em}
+  .mk-eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:30px;height:30px;
+    border:none;background:none;color:var(--ink-3);cursor:pointer;display:flex;align-items:center;justify-content:center;
+    border-radius:8px;transition:color .2s}
+  .mk-eye:hover{color:var(--ink-2)}
+  .md-hint{font-size:11.5px;color:var(--ink-3);line-height:1.65;margin-top:6px}
+  .md-hint b{font-weight:500;color:var(--ink-2)}
+  /* 模型输入 + 拉取 */
+  .md-row{display:flex;gap:8px;align-items:center}
+  .md-row .p-in{flex:1;min-width:0}
+  .ghost{flex:none;display:inline-flex;align-items:center;gap:5px;font-family:inherit;font-size:11.5px;
+    color:var(--ink-2);background:none;border:1px solid var(--line);border-radius:999px;padding:7px 12px;
+    cursor:pointer;transition:all .2s;white-space:nowrap}
+  .ghost:hover{border-color:var(--mist);color:var(--mist-deep)}
+  .ghost[disabled]{opacity:.55;cursor:default}
+  .spin{animation:sp .9s linear infinite;transform-origin:50% 50%}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  /* 测试连接 */
+  .md-test{margin-top:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .md-st{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink-3);
+    background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:4px 11px;line-height:1.5}
+  .md-st.ok{color:#3F7A5E;border-color:#CFE3D8;background:#F1F7F3}
+  .md-st.bad{color:#B3666A;border-color:#EBD6D7;background:#FAF2F2}
+  .md-st.run{color:var(--mist-deep);border-color:#CFE0EA;background:var(--mist-faint)}
+  .md-st svg{flex:none}
+  /* 高级分功能模型 */
+  .p-chain{margin-top:18px;border-radius:12px;background:var(--bg);border:1px dashed var(--line);overflow:hidden}
+  .p-chain summary{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink-3);
+    letter-spacing:.04em;padding:10px 13px;cursor:pointer;user-select:none;list-style:none}
+  .p-chain summary::-webkit-details-marker{display:none}
+  .p-chain summary:hover{color:var(--mist-deep)}
+  .p-chain summary svg{flex-shrink:0;transition:transform .25s}
+  .p-chain[open] summary svg{transform:rotate(90deg)}
+  .p-chain summary .c-badge{margin-left:auto;font-size:10.5px;color:var(--mist-deep);background:var(--mist-faint);
+    border-radius:999px;padding:1px 8px}
+  .pc-body{padding:2px 13px 14px;border-top:1px dashed var(--line)}
+  .pc-body .p-field:first-child{margin-top:12px}
+  /* toast */
+  .toast{position:fixed;left:50%;bottom:calc(26px + env(safe-area-inset-bottom));transform:translateX(-50%) translateY(12px);
+    background:rgba(58,64,70,.94);color:#F7F9FA;font-size:12.5px;letter-spacing:.04em;
+    padding:9px 18px;border-radius:999px;opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;z-index:120}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="demo-note">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
+    <span>演示页：只在本地模拟，不写任何设置、不发真实请求。确认这套交互后再整合进主站设置 → 模型。</span>
+  </div>
+
+  <div class="p-panel">
+    <div class="p-head">
+      <h3>设置</h3>
+      <button class="p-x" type="button" aria-label="关闭"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+    <div class="set-tabs" role="tablist">
+      <button class="set-tab" type="button" role="tab" aria-selected="false">人设</button>
+      <button class="set-tab" type="button" role="tab" aria-selected="false">我的</button>
+      <button class="set-tab" type="button" role="tab" aria-selected="false">记忆</button>
+      <button class="set-tab on" type="button" role="tab" aria-selected="true">模型</button>
+      <button class="set-tab" type="button" role="tab" aria-selected="false">数据</button>
+    </div>
+
+    <p class="p-sub">切换接入的 API 网关与模型。填好点「测试连接」确认通了，再保存。</p>
+
+    <!-- 1. 服务商预设 -->
+    <label class="p-field">服务商</label>
+    <div class="md-presets" id="presets">
+      <button class="p-opt" type="button" data-on="1" data-u="https://api.deepseek.com" data-m="deepseek-chat" data-r="deepseek-chat">DeepSeek</button>
+      <button class="p-opt" type="button" data-u="https://api.deepseek.com/v1" data-m="deepseek-chat" data-r="deepseek-reasoner">DeepSeek 官方</button>
+      <button class="p-opt" type="button" data-u="https://ark.cn-beijing.volces.com/api/v3" data-m="doubao-seed-1-6-250615" data-r="doubao-seed-1-6-thinking-250715">火山方舟</button>
+      <button class="p-opt" type="button" data-u="" data-m="" data-r="">自定义</button>
+    </div>
+
+    <!-- 2. 地址 -->
+    <label class="p-field" for="mdUrl">模型服务地址（OpenAI 兼容 /chat/completions）</label>
+    <input class="p-in" id="mdUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://.../v1">
+
+    <!-- 3. Key -->
+    <label class="p-field" for="mdKey">API Key</label>
+    <div class="md-key" id="mdKeySaved">
+      <span class="mk-dot" aria-hidden="true"></span>
+      <span class="mk-txt">已保存 <code>sk-••••••••bd4e</code></span>
+      <button class="mk-b" type="button" id="mkChange">更换</button>
+      <button class="mk-b bad" type="button" id="mkClear">清除</button>
+    </div>
+    <div class="md-key-in" id="mdKeyEdit" hidden>
+      <input class="p-in" id="mdKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-...（留空 = 不改动已保存的 Key）">
+      <button class="mk-eye" type="button" id="mdKeyEye" aria-label="显示或隐藏 Key">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></svg>
+      </button>
+    </div>
+    <p class="md-hint">Key 只写进服务器端 <b>settings.json</b>（权限 600），接口只回传后 4 位，页面永远拿不到明文。</p>
+
+    <!-- 4. 模型 -->
+    <label class="p-field" for="mdModel">普通聊天模型</label>
+    <div class="md-row">
+      <input class="p-in" id="mdModel" type="text" list="mdModels" autocomplete="off" spellcheck="false" placeholder="deepseek-chat">
+      <button class="ghost" type="button" id="mdPull">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+        拉取列表
+      </button>
+    </div>
+    <label class="p-field" for="mdReason">深度思考模型</label>
+    <input class="p-in" id="mdReason" type="text" list="mdModels" autocomplete="off" spellcheck="false" placeholder="不填则同普通模型">
+    <datalist id="mdModels"></datalist>
+    <p class="md-hint" id="mdPullHint">「拉取列表」走后端请求 <b>{地址}/models</b>，把该网关可用模型填成候选。</p>
+
+    <!-- 5. 超时 -->
+    <label class="p-field" for="mdTimeout">后端超时（10–120 秒）</label>
+    <input class="p-in" id="mdTimeout" type="number" min="10" max="120" inputmode="numeric" value="60">
+
+    <!-- 6. 测试连接 -->
+    <div class="md-test">
+      <button class="ghost" type="button" id="mdTest">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 2 4.5 13.5H11l-1 8.5L19.5 10H13z"/></svg>
+        测试连接
+      </button>
+      <span class="md-st" id="mdSt">未测试</span>
+    </div>
+    <p class="md-hint">测试由后端发起（浏览器 CSP 只允许同源请求），只发一次最小请求，不消耗多少额度。</p>
+
+    <!-- 7. 高级：分功能模型 -->
+    <details class="p-chain">
+      <summary>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        高级：分功能指定模型
+        <span class="c-badge">可选 · 不要就说</span>
+      </summary>
+      <div class="pc-body">
+        <p class="md-hint" style="margin:10px 0 0">留空 = 跟随上面的普通聊天模型。只在你想省钱/提速时用，例如记忆整理换小模型。</p>
+        <label class="p-field" for="mdPersona">人设生成</label>
+        <input class="p-in" id="mdPersona" type="text" list="mdModels" placeholder="跟随普通模型">
+        <label class="p-field" for="mdMem">记忆整理</label>
+        <input class="p-in" id="mdMem" type="text" list="mdModels" placeholder="跟随普通模型">
+        <label class="p-field" for="mdDiary">日记总结</label>
+        <input class="p-in" id="mdDiary" type="text" list="mdModels" placeholder="跟随普通模型">
+        <label class="p-field" for="mdTitle">标题 / 情绪判定</label>
+        <input class="p-in" id="mdTitle" type="text" list="mdModels" placeholder="跟随普通模型">
+      </div>
+    </details>
+
+    <div class="p-actions">
+      <button class="p-btn p-reset" type="button" id="mdDefault">恢复默认</button>
+      <button class="p-btn p-save" type="button" id="mdSave">保存</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var PRESETS = [].slice.call(document.querySelectorAll('#presets .p-opt'));
+  var saved = { tail: 'bd4e' };            // 后端只回传尾号，无明文
+  var edited = false;                       // 是否点了「更换」
+
+  function toast(t){
+    var el = $('toast'); el.textContent = t; el.classList.add('show');
+    clearTimeout(el._t); el._t = setTimeout(function(){ el.classList.remove('show'); }, 2000);
+  }
+  function st(kind, text){
+    var el = $('mdSt');
+    el.className = 'md-st' + (kind ? ' ' + kind : '');
+    var ic = '';
+    if (kind === 'run') ic = '<svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7"/></svg>';
+    if (kind === 'ok')  ic = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 12.5 9 17.5 20 6.5"/></svg>';
+    if (kind === 'bad') ic = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 7v6M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg>';
+    el.innerHTML = ic + '<span>' + text + '</span>';
+  }
+  function markPreset(url){
+    var hit = false;
+    PRESETS.forEach(function(b){
+      var on = b.dataset.u && b.dataset.u === url;
+      b.dataset.on = on ? '1' : '0';
+      if (on) hit = true;
+    });
+    if (!hit) PRESETS[PRESETS.length - 1].dataset.on = '1';   // 自定义
+  }
+
+  /* 服务商预设 */
+  PRESETS.forEach(function(b){
+    b.addEventListener('click', function(){
+      if (b.dataset.u){
+        $('mdUrl').value = b.dataset.u;
+        $('mdModel').value = b.dataset.m;
+        $('mdReason').value = b.dataset.r;
+      }
+      markPreset(b.dataset.u || $('mdUrl').value.trim());
+      st('', '未测试');
+    });
+  });
+
+  /* Key：更换 / 清除 / 明暗 */
+  $('mkChange').addEventListener('click', function(){
+    $('mdKeySaved').hidden = true; $('mdKeyEdit').hidden = false;
+    edited = true; $('mdKey').value = ''; $('mdKey').focus();
+  });
+  $('mkClear').addEventListener('click', function(){
+    $('mdKeySaved').hidden = true; $('mdKeyEdit').hidden = false;
+    edited = true; $('mdKey').value = ''; $('mdKey').placeholder = '留空则清除已保存的 Key';
+    toast('保存后将清除 Key（回落到服务器默认）');
+  });
+  $('mdKeyEye').addEventListener('click', function(){
+    var i = $('mdKey'), open = i.type === 'password';
+    i.type = open ? 'text' : 'password';
+    this.innerHTML = open
+      ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M3 3l18 18"/><path d="M10.6 6.1A9.9 9.9 0 0 1 12 6c6.4 0 10 6 10 6a17 17 0 0 1-3.2 3.9M6.3 8.2A16.6 16.6 0 0 0 2 12s3.6 6 10 6a9.6 9.6 0 0 0 3.6-.7"/></svg>'
+      : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></svg>';
+    i.focus();
+  });
+
+  /* 拉取模型列表（演示：模拟 700ms 后的返回） */
+  $('mdPull').addEventListener('click', function(){
+    var b = this;
+    b.disabled = true;
+    b.querySelector('svg').classList.add('spin');
+    $('mdPullHint').textContent = '正在向 ' + ($('mdUrl').value.trim() || '（未填地址）') + '/models 请求…';
+    setTimeout(function(){
+      var list = ['deepseek-chat', 'deepseek-chat', 'deepseek-reasoner', 'deepseek-v3.1', 'ernie-4.5-turbo-32k'];
+      $('mdModels').innerHTML = list.map(function(m){ return '<option value="' + m + '"></option>'; }).join('');
+      b.disabled = false;
+      b.querySelector('svg').classList.remove('spin');
+      $('mdPullHint').innerHTML = '已获取 <b>' + list.length + '</b> 个模型，在输入框里就能选到。';
+    }, 700);
+  });
+
+  /* 测试连接（演示：模拟延迟与两种结果） */
+  $('mdTest').addEventListener('click', function(){
+    var url = $('mdUrl').value.trim(), model = $('mdModel').value.trim();
+    var key = edited ? $('mdKey').value.trim() : saved.tail;
+    if (!/^https?:\/\//.test(url)) { st('bad', '地址要以 http(s):// 开头'); return; }
+    if (!key) { st('bad', '缺少 API Key（HTTP 401 未授权）'); return; }
+    st('run', '正在握手…');
+    setTimeout(function(){
+      if (/cqjtu/.test(url)) { st('bad', '连接超时（DeepSeek校外不可达）'); }
+      else { st('ok', '连接成功 · 延迟 320ms · 模型回显 ' + (model || 'deepseek-chat')); }
+    }, 900);
+  });
+
+  /* 保存（演示） */
+  $('mdSave').addEventListener('click', function(){
+    var url = $('mdUrl').value.trim();
+    if (!/^https?:\/\//.test(url)) { toast('模型服务地址要填完整 http(s)://'); return; }
+    var tail = edited ? ($('mdKey').value.trim().slice(-4) || '（已清除）') : saved.tail;
+    if (edited && $('mdKey').value.trim()) { saved.tail = $('mdKey').value.trim().slice(-4); }
+    edited = false;
+    $('mdKeyEdit').hidden = true; $('mdKeySaved').hidden = false;
+    $('mdKeySaved').querySelector('.mk-txt').innerHTML = saved.tail === '（已清除）'
+      ? '未保存 Key，用服务器默认'
+      : '已保存 <code>sk-••••••••' + saved.tail + '</code>';
+    $('mdKey').value = '';
+    toast('模型设置已保存（演示，未真的写服务器）');
+  });
+
+  /* 恢复默认（演示） */
+  $('mdDefault').addEventListener('click', function(){
+    $('mdUrl').value = 'https://api.deepseek.com';
+    $('mdModel').value = 'deepseek-chat';
+    $('mdReason').value = 'deepseek-chat';
+    $('mdTimeout').value = 60;
+    ['mdPersona', 'mdMem', 'mdDiary', 'mdTitle'].forEach(function(id){ $(id).value = ''; });
+    markPreset($('mdUrl').value);
+    st('', '未测试');
+    toast('已还原为服务器默认（演示）');
+  });
+
+  /* 初始化 */
+  $('mdUrl').value = 'https://api.deepseek.com';
+  $('mdModel').value = 'deepseek-chat';
+  $('mdReason').value = 'deepseek-chat';
+  markPreset($('mdUrl').value);
+  $('mdUrl').addEventListener('input', function(){ markPreset(this.value.trim()); st('', '未测试'); });
+})();
+</script>
+</body>
+</html>

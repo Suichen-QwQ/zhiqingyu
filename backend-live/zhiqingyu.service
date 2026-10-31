@@ -1,0 +1,19 @@
+[Unit]
+Description=ZhiQingYu /api/chat backend (DeepSeek emotional companion)
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/zhiqingyu
+EnvironmentFile=/home/admin/zhiqingyu/.env.secret
+Environment=PYTHONUNBUFFERED=1
+Environment=ZQY_LISTEN_HOST=127.0.0.1
+Environment=ZQY_LISTEN_PORT=8092
+Environment=ZQY_STATIC_DIR=/usr/share/nginx/html/zhiqingyu
+ExecStart=/usr/bin/python3 /home/admin/zhiqingyu/chat_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

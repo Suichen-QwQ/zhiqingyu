@@ -1,0 +1,1132 @@
+<template>
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+    <!-- 左侧：时间轴 -->
+    <div class="md:col-span-1">
+      <n-card class="timeline-card">
+        <div class="card-header">
+          <h2 class="card-title">{{ $t('journal.last30Days') }}</h2>
+        </div>
+        <div class="timeline-container">
+          <div v-if="dailyList.length === 0" class="empty-timeline">
+            <div class="empty-icon">📅</div>
+            <p class="empty-text">{{ $t('common.noData') }}</p>
+          </div>
+          <div
+            v-for="item in dailyList"
+            :key="item.date"
+            :class="[
+              'timeline-item',
+              selectedDate === item.date ? 'timeline-item-active' : '',
+            ]"
+            @click="setSelectedDate(item.date)"
+          >
+            <div class="timeline-dot-wrapper">
+              <div
+                class="timeline-dot"
+                :style="{ backgroundColor: getEmotionColorHex(item.main_emotion) }"
+              />
+            </div>
+            <div class="timeline-content">
+              <div class="timeline-date">
+                {{ formatDate(item.date) }}
+              </div>
+              <div class="timeline-emotion">
+                <span class="emotion-label">{{ getEmotionLabel(item.main_emotion) }}</span>
+                <span v-if="item.avg_intensity" class="intensity-badge">
+                  {{ item.avg_intensity.toFixed(1) }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </n-card>
+    </div>
+
+    <!-- 右侧：详情 -->
+    <div class="md:col-span-2">
+      <n-card class="detail-card">
+        <n-spin :show="loading">
+          <div v-if="detail" class="detail-content">
+            <div class="detail-header">
+              <h2 class="detail-title">
+                {{ formatDateFull(detail.date) }}
+              </h2>
+              <div class="detail-meta">
+                <div class="meta-item">
+                  <span class="meta-label">{{ $t('journal.mainEmotion') }}</span>
+                  <span class="meta-value emotion-highlight">
+                    {{ getEmotionLabel(detail.main_emotion) }}
+                  </span>
+                </div>
+                <div v-if="detail.avg_intensity" class="meta-item">
+                  <span class="meta-label">{{ $t('journal.avgIntensity') }}</span>
+                  <span class="meta-value">{{ detail.avg_intensity.toFixed(1) }}</span>
+                </div>
+              </div>
+              <p v-if="detail.summary_text" class="summary-text">
+                {{ detail.summary_text }}
+              </p>
+              <div v-if="detail.main_topics && detail.main_topics.length > 0" class="topics-section">
+                <span class="topics-label">{{ $t('journal.topics') }}</span>
+                <div class="topics-list">
+                  <n-tag
+                    v-for="(topic, index) in detail.main_topics"
+                    :key="index"
+                    class="topic-tag"
+                    size="medium"
+                  >
+                    {{ topic }}
+                  </n-tag>
+                </div>
+              </div>
+            </div>
+
+            <!-- 按主题聚合的日记内容 -->
+            <div v-if="detail.topic_groups && detail.topic_groups.length > 0" class="topics-journal-section">
+              <h3 class="section-title">{{ $t('journal.dailyJournal') }}</h3>
+              <div class="topic-groups-list">
+                <div
+                  v-for="(topicGroup, index) in detail.topic_groups"
+                  :key="index"
+                  class="topic-group-card"
+                >
+                  <div class="topic-group-header">
+                    <div class="topic-group-title-wrapper">
+                      <h4 class="topic-group-title">{{ topicGroup.topic }}</h4>
+                      <span class="topic-message-count">{{ topicGroup.message_count }} {{ $t('journal.messages') }}</span>
+                    </div>
+                    <div v-if="topicGroup.emotion_summary" class="topic-emotion-badge">
+                      <span class="emotion-dot" :style="{ backgroundColor: getEmotionColorHex(topicGroup.emotion_summary) }"></span>
+                      <span class="emotion-text">{{ getEmotionLabel(topicGroup.emotion_summary) }}</span>
+                    </div>
+                  </div>
+                  
+                  <!-- 叙事式摘要（默认显示） -->
+                  <div v-if="topicGroup.narrative_summary" class="narrative-summary">
+                    <p class="narrative-text">{{ topicGroup.narrative_summary }}</p>
+                  </div>
+                  
+                  <!-- 如果没有叙事式摘要，显示提示 -->
+                  <div v-else class="narrative-summary narrative-placeholder">
+                    <p class="narrative-text">{{ $t('journal.narrativeGenerating') || '正在生成叙事式摘要...' }}</p>
+                  </div>
+                  
+                  <!-- 展开/收起对话按钮 -->
+                  <div class="toggle-messages-wrapper">
+                    <button
+                      @click="toggleTopicMessages(index)"
+                      class="toggle-messages-btn"
+                      :class="{ 'expanded': expandedTopics.has(index) }"
+                    >
+                      <span class="toggle-icon">{{ expandedTopics.has(index) ? '▼' : '▶' }}</span>
+                      <span class="toggle-text">
+                        {{ expandedTopics.has(index) ? ($t('journal.hideConversation') || '收起对话') : ($t('journal.viewConversation') || '查看对话') }}
+                      </span>
+                    </button>
+                  </div>
+                  
+                  <!-- 详细对话（可展开/收起） -->
+                  <div
+                    v-show="expandedTopics.has(index)"
+                    class="topic-messages-list"
+                  >
+                    <div
+                      v-for="msg in topicGroup.messages"
+                      :key="msg.id"
+                      :class="[
+                        'topic-message-card',
+                        msg.role === 'user' ? 'message-user' : 'message-assistant',
+                      ]"
+                    >
+                      <div class="message-header">
+                        <span class="message-role">
+                          {{ msg.role === 'user' ? $t('journal.you') : $t('journal.assistant') }}
+                        </span>
+                        <span class="message-time">
+                          {{ formatTime(msg.created_at) }}
+                        </span>
+                      </div>
+                      <p class="message-body">{{ msg.content }}</p>
+                      <div v-if="msg.emotion" class="message-emotion">
+                        <span class="emotion-indicator">{{ getEmotionLabel(msg.emotion) }}</span>
+                        <span v-if="msg.intensity" class="intensity-indicator">
+                          {{ msg.intensity }}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- 如果没有主题分组，回退到原来的消息列表 -->
+            <div v-else-if="detail.messages && detail.messages.length > 0" class="messages-section">
+              <h3 class="section-title">{{ $t('journal.representativeMessages') }}</h3>
+              <div class="messages-list">
+                <div
+                  v-for="msg in detail.messages"
+                  :key="msg.id"
+                  :class="[
+                    'message-card',
+                    msg.role === 'user' ? 'message-user' : 'message-assistant',
+                  ]"
+                >
+                  <div class="message-header">
+                    <span class="message-role">
+                      {{ msg.role === 'user' ? $t('journal.you') : $t('journal.assistant') }}
+                    </span>
+                    <span class="message-time">
+                      {{ formatTime(msg.created_at) }}
+                    </span>
+                  </div>
+                  <p class="message-body">{{ msg.content }}</p>
+                  <div v-if="msg.emotion" class="message-emotion">
+                    <span class="emotion-indicator">{{ getEmotionLabel(msg.emotion) }}</span>
+                    <span v-if="msg.intensity" class="intensity-indicator">
+                      {{ msg.intensity }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-else class="empty-detail">
+            <div class="empty-icon-large">📔</div>
+            <p class="empty-text-large">{{ $t('journal.selectDate') }}</p>
+          </div>
+        </n-spin>
+      </n-card>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, watch, computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { format, subDays, parseISO } from 'date-fns'
+import { zhCN, enUS } from 'date-fns/locale'
+import { NCard, NSpin, NTag } from 'naive-ui'
+import {
+  getDailyList,
+  getDailyDetail,
+  type DailySummaryItem,
+  type DailyDetailResponse,
+  type TopicGroup,
+} from '@/lib/api'
+
+const { t, locale } = useI18n()
+
+const dailyList = ref<DailySummaryItem[]>([])
+const selectedDate = ref<string | null>(null)
+const detail = ref<DailyDetailResponse | null>(null)
+const loading = ref(false)
+const expandedTopics = ref<Set<number>>(new Set())  // 记录哪些主题的对话已展开
+
+const dateLocale = computed(() => {
+  return locale.value === 'zh' ? zhCN : enUS
+})
+
+onMounted(() => {
+  loadDailyList()
+})
+
+watch(selectedDate, (newDate) => {
+  if (newDate) {
+    loadDailyDetail(newDate)
+  }
+})
+
+const loadDailyList = async () => {
+  try {
+    const toDate = format(new Date(), 'yyyy-MM-dd')
+    const fromDate = format(subDays(new Date(), 30), 'yyyy-MM-dd')
+
+    const response = await getDailyList(fromDate, toDate)
+    if (response.error) {
+      console.error('Error loading daily list:', response.error)
+      return
+    }
+
+    if (response.data) {
+      dailyList.value = response.data.items
+      // 默认选择今天
+      if (response.data.items.length > 0) {
+        selectedDate.value = response.data.items[0].date
+      }
+    }
+  } catch (error) {
+    console.error('Failed to load daily list:', error)
+  }
+}
+
+const loadDailyDetail = async (date: string) => {
+  loading.value = true
+  try {
+    const response = await getDailyDetail(date)
+    if (response.error) {
+      console.error('Error loading daily detail:', response.error)
+      return
+    }
+
+    if (response.data) {
+      detail.value = response.data
+    }
+  } catch (error) {
+    console.error('Failed to load daily detail:', error)
+  } finally {
+    loading.value = false
+  }
+}
+
+const setSelectedDate = (date: string) => {
+  selectedDate.value = date
+}
+
+const getEmotionColor = (emotion: string | null) => {
+  if (!emotion) return 'bg-gray-200'
+  const colors: Record<string, string> = {
+    joy: 'bg-yellow-400',
+    sadness: 'bg-blue-400',
+    anxiety: 'bg-orange-400',
+    anger: 'bg-red-400',
+    tired: 'bg-purple-400',
+    neutral: 'bg-gray-300',
+    relief: 'bg-green-400',
+    calm: 'bg-teal-400',
+  }
+  return colors[emotion] || 'bg-gray-200'
+}
+
+const getEmotionColorHex = (emotion: string | null) => {
+  if (!emotion) return '#E0E0E0'
+  const colors: Record<string, string> = {
+    joy: '#FFD4A3',
+    sadness: '#B3D9FF',
+    anxiety: '#FFB3BA',
+    anger: '#FF9F9F',
+    tired: '#D4B3FF',
+    neutral: '#E0E0E0',
+    relief: '#B3FFB3',
+    calm: '#B3E5D1',
+  }
+  return colors[emotion] || '#E0E0E0'
+}
+
+const getEmotionLabel = (emotion: string | null) => {
+  if (!emotion) return t('emotions.none')
+  const emotionKey = emotion as keyof typeof import('@/i18n/zh').default.emotions
+  try {
+    return t(`emotions.${emotionKey}`) || emotion
+  } catch {
+    return emotion
+  }
+}
+
+const formatDate = (dateStr: string) => {
+  return format(parseISO(dateStr), 'M月d日', { locale: dateLocale.value })
+}
+
+const formatDateFull = (dateStr: string) => {
+  return format(parseISO(dateStr), 'yyyy年M月d日', { locale: dateLocale.value })
+}
+
+const formatTime = (dateStr: string) => {
+  return format(parseISO(dateStr), 'HH:mm', { locale: dateLocale.value })
+}
+
+const toggleTopicMessages = (index: number) => {
+  if (expandedTopics.value.has(index)) {
+    expandedTopics.value.delete(index)
+  } else {
+    expandedTopics.value.add(index)
+  }
+}
+
+// 当切换日期时，清空展开状态
+watch(selectedDate, () => {
+  expandedTopics.value.clear()
+})
+</script>
+
+<style scoped>
+.grid {
+  display: grid;
+}
+
+.gap-6 {
+  gap: 1.5rem;
+}
+
+.grid-cols-1 {
+  grid-template-columns: repeat(1, minmax(0, 1fr));
+}
+
+@media (min-width: 768px) {
+  .md\:grid-cols-3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .md\:col-span-1 {
+    grid-column: span 1 / span 1;
+  }
+  .md\:col-span-2 {
+    grid-column: span 2 / span 2;
+  }
+}
+
+.timeline-card {
+  background: rgba(255, 255, 255, 0.98) !important;
+  border: 1px solid rgba(255, 182, 193, 0.25) !important;
+  border-radius: 24px !important;
+  box-shadow: 0 4px 24px rgba(255, 182, 193, 0.12) !important;
+  backdrop-filter: blur(20px);
+  transition: all 0.3s ease;
+  outline: none !important;
+}
+
+.timeline-card :deep(.n-card) {
+  outline: none !important;
+  border: none !important;
+}
+
+.timeline-card :deep(.n-card__content) {
+  outline: none !important;
+}
+
+.timeline-card:hover {
+  box-shadow: 0 6px 32px rgba(255, 182, 193, 0.18) !important;
+}
+
+.card-header {
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid rgba(255, 182, 193, 0.15);
+}
+
+.card-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  background: linear-gradient(135deg, #D9779F 0%, #C97A9A 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin: 0;
+}
+
+.timeline-container {
+  max-height: 600px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.timeline-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+.timeline-container::-webkit-scrollbar-track {
+  background: rgba(255, 182, 193, 0.05);
+  border-radius: 10px;
+}
+
+.timeline-container::-webkit-scrollbar-thumb {
+  background: rgba(255, 182, 193, 0.3);
+  border-radius: 10px;
+}
+
+.empty-timeline {
+  text-align: center;
+  padding: 3rem 1rem;
+  color: #B8A8A8;
+}
+
+.empty-icon {
+  font-size: 3rem;
+  opacity: 0.5;
+  margin-bottom: 1rem;
+}
+
+.empty-text {
+  font-size: 0.9rem;
+}
+
+.timeline-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 1.25rem;
+  margin-bottom: 0.75rem;
+  border-radius: 18px;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  background: rgba(255, 250, 245, 0.6);
+  border: 2px solid transparent;
+  position: relative;
+  overflow: hidden;
+}
+
+.timeline-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: linear-gradient(180deg, #FFB6C1 0%, #FFA07A 100%);
+  transform: scaleY(0);
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.timeline-item:hover {
+  background: rgba(255, 245, 245, 0.8);
+  transform: translateX(6px);
+  border-color: rgba(255, 182, 193, 0.35);
+  box-shadow: 0 4px 16px rgba(255, 182, 193, 0.15);
+}
+
+.timeline-item:hover::before {
+  transform: scaleY(1);
+}
+
+.timeline-item-active {
+  background: linear-gradient(135deg, rgba(255, 182, 193, 0.2) 0%, rgba(255, 218, 185, 0.2) 100%);
+  border-color: rgba(255, 182, 193, 0.45);
+  box-shadow: 0 6px 20px rgba(255, 182, 193, 0.25);
+  transform: translateX(4px);
+}
+
+.timeline-item-active::before {
+  transform: scaleY(1);
+}
+
+.timeline-dot-wrapper {
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.timeline-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  border: 2px solid white;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+}
+
+.timeline-item:hover .timeline-dot {
+  transform: scale(1.3);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.timeline-item-active .timeline-dot {
+  transform: scale(1.4);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.timeline-dot::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: white;
+  opacity: 0.8;
+}
+
+.timeline-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.timeline-date {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #8B6F7E;
+  margin-bottom: 0.25rem;
+}
+
+.timeline-emotion {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.emotion-label {
+  font-size: 0.85rem;
+  color: #A68A8A;
+}
+
+.intensity-badge {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  background: rgba(255, 182, 193, 0.2);
+  border-radius: 10px;
+  color: #8B6F7E;
+  font-weight: 500;
+}
+
+.detail-card {
+  background: rgba(255, 255, 255, 0.98) !important;
+  border: 1px solid rgba(255, 182, 193, 0.25) !important;
+  border-radius: 24px !important;
+  box-shadow: 0 4px 24px rgba(255, 182, 193, 0.12) !important;
+  backdrop-filter: blur(20px);
+  min-height: 600px;
+  transition: all 0.3s ease;
+  outline: none !important;
+}
+
+.detail-card :deep(.n-card) {
+  outline: none !important;
+  border: none !important;
+}
+
+.detail-card :deep(.n-card__content) {
+  outline: none !important;
+}
+
+.detail-card:hover {
+  box-shadow: 0 6px 32px rgba(255, 182, 193, 0.18) !important;
+}
+
+.detail-content {
+  animation: fadeIn 0.4s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.detail-header {
+  margin-bottom: 2rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid rgba(255, 182, 193, 0.15);
+}
+
+.detail-title {
+  font-size: 1.75rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, #D9779F 0%, #C97A9A 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin: 0 0 1rem 0;
+}
+
+.detail-meta {
+  display: flex;
+  gap: 2rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.meta-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.meta-label {
+  font-size: 0.9rem;
+  color: #A68A8A;
+}
+
+.meta-value {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #8B6F7E;
+}
+
+.emotion-highlight {
+  padding: 4px 12px;
+  background: linear-gradient(135deg, rgba(255, 182, 193, 0.15) 0%, rgba(255, 218, 185, 0.15) 100%);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 182, 193, 0.3);
+}
+
+.summary-text {
+  font-size: 1rem;
+  line-height: 1.7;
+  color: #6B5A6B;
+  margin: 1rem 0;
+  padding: 1rem;
+  background: rgba(255, 250, 245, 0.6);
+  border-radius: 12px;
+  border-left: 3px solid rgba(255, 182, 193, 0.4);
+}
+
+.topics-section {
+  margin-top: 1.5rem;
+}
+
+.topics-label {
+  display: block;
+  font-size: 0.9rem;
+  color: #A68A8A;
+  margin-bottom: 0.75rem;
+  font-weight: 500;
+}
+
+.topics-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.topic-tag {
+  background: linear-gradient(135deg, rgba(255, 182, 193, 0.2) 0%, rgba(255, 218, 185, 0.2) 100%) !important;
+  border: 1px solid rgba(255, 182, 193, 0.35) !important;
+  color: #8B6F7E !important;
+  border-radius: 18px !important;
+  padding: 8px 16px !important;
+  font-weight: 500 !important;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 6px rgba(255, 182, 193, 0.1);
+  position: relative;
+  overflow: hidden;
+  cursor: default;
+}
+
+.topic-tag::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+  transition: left 0.5s ease;
+}
+
+.topic-tag:hover {
+  transform: translateY(-3px) scale(1.05);
+  box-shadow: 0 4px 12px rgba(255, 182, 193, 0.25);
+  border-color: rgba(255, 182, 193, 0.5) !important;
+}
+
+.topic-tag:hover::before {
+  left: 100%;
+}
+
+.messages-section {
+  margin-top: 2rem;
+}
+
+.section-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #8B6F7E;
+  margin-bottom: 1.5rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid rgba(255, 182, 193, 0.15);
+}
+
+.messages-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.message-card {
+  padding: 1.5rem;
+  border-radius: 18px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-left: 4px solid;
+  animation: slideIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 8px rgba(255, 182, 193, 0.08);
+  position: relative;
+  overflow: hidden;
+}
+
+.message-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(255, 182, 193, 0.5), transparent);
+  transform: translateX(-100%);
+  transition: transform 0.5s ease;
+}
+
+.message-card:hover::before {
+  transform: translateX(100%);
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.message-user {
+  background: linear-gradient(135deg, rgba(255, 182, 193, 0.1) 0%, rgba(255, 218, 185, 0.1) 100%);
+  border-left-color: #FFB6C1;
+}
+
+.message-assistant {
+  background: rgba(255, 250, 245, 0.6);
+  border-left-color: rgba(255, 182, 193, 0.3);
+}
+
+.message-card:hover {
+  transform: translateX(6px);
+  box-shadow: 0 6px 20px rgba(255, 182, 193, 0.2);
+}
+
+.message-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.message-role {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #8B6F7E;
+}
+
+.message-time {
+  font-size: 0.8rem;
+  color: #B8A8A8;
+}
+
+.message-body {
+  font-size: 0.95rem;
+  line-height: 1.7;
+  color: #4A4A4A;
+  margin: 0;
+}
+
+.message-emotion {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid rgba(255, 182, 193, 0.1);
+}
+
+.emotion-indicator {
+  font-size: 0.8rem;
+  padding: 3px 10px;
+  background: rgba(255, 182, 193, 0.15);
+  border-radius: 10px;
+  color: #8B6F7E;
+  font-weight: 500;
+}
+
+.intensity-indicator {
+  font-size: 0.75rem;
+  color: #B8A8A8;
+}
+
+.empty-detail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 5rem 1rem;
+  color: #B8A8A8;
+  min-height: 400px;
+}
+
+.empty-icon-large {
+  font-size: 5rem;
+  opacity: 0.5;
+  margin-bottom: 1.5rem;
+  filter: drop-shadow(0 4px 8px rgba(255, 182, 193, 0.2));
+}
+
+.empty-text-large {
+  font-size: 1.1rem;
+}
+
+/* 主题聚合日记样式 */
+.topics-journal-section {
+  margin-top: 2rem;
+}
+
+.topic-groups-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.topic-group-card {
+  background: linear-gradient(135deg, rgba(255, 250, 245, 0.8) 0%, rgba(255, 245, 245, 0.6) 100%);
+  border: 2px solid rgba(255, 182, 193, 0.2);
+  border-radius: 20px;
+  padding: 1.5rem;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 12px rgba(255, 182, 193, 0.1);
+  position: relative;
+  overflow: hidden;
+  animation: slideInUp 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.topic-group-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, #FFB6C1 0%, #FFA07A 50%, #FFB6C1 100%);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.5s ease;
+}
+
+.topic-group-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 24px rgba(255, 182, 193, 0.2);
+  border-color: rgba(255, 182, 193, 0.4);
+}
+
+.topic-group-card:hover::before {
+  transform: scaleX(1);
+}
+
+@keyframes slideInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.topic-group-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 2px solid rgba(255, 182, 193, 0.15);
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.topic-group-title-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex: 1;
+}
+
+.topic-group-title {
+  font-size: 1.35rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, #D9779F 0%, #C97A9A 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.topic-message-count {
+  font-size: 0.85rem;
+  color: #A68A8A;
+  background: rgba(255, 182, 193, 0.15);
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+
+.topic-emotion-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 6px 14px;
+  background: rgba(255, 182, 193, 0.15);
+  border-radius: 16px;
+  border: 1px solid rgba(255, 182, 193, 0.3);
+}
+
+.emotion-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+  border: 2px solid white;
+}
+
+.emotion-text {
+  font-size: 0.85rem;
+  color: #8B6F7E;
+  font-weight: 600;
+}
+
+.topic-messages-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.topic-message-card {
+  padding: 1.25rem;
+  border-radius: 16px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-left: 3px solid;
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow: 0 1px 6px rgba(255, 182, 193, 0.08);
+  position: relative;
+  overflow: hidden;
+}
+
+.topic-message-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(255, 182, 193, 0.4), transparent);
+  transform: translateX(-100%);
+  transition: transform 0.5s ease;
+}
+
+.topic-message-card:hover {
+  transform: translateX(4px);
+  box-shadow: 0 4px 16px rgba(255, 182, 193, 0.15);
+}
+
+.topic-message-card:hover::before {
+  transform: translateX(100%);
+}
+
+.topic-message-card.message-user {
+  border-left-color: #FFB6C1;
+  background: linear-gradient(135deg, rgba(255, 182, 193, 0.08) 0%, rgba(255, 218, 185, 0.08) 100%);
+}
+
+.topic-message-card.message-assistant {
+  border-left-color: rgba(255, 182, 193, 0.25);
+  background: rgba(255, 250, 245, 0.5);
+}
+
+/* 叙事式摘要样式 */
+.narrative-summary {
+  margin: 1.25rem 0;
+  padding: 1.5rem;
+  background: linear-gradient(135deg, rgba(255, 250, 245, 0.95) 0%, rgba(255, 245, 250, 0.9) 100%);
+  border-radius: 16px;
+  border: 1px solid rgba(255, 182, 193, 0.2);
+  box-shadow: 0 2px 8px rgba(255, 182, 193, 0.08);
+  position: relative;
+  overflow: hidden;
+}
+
+.narrative-summary::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 4px;
+  height: 100%;
+  background: linear-gradient(180deg, #FFB6C1 0%, #FFA07A 100%);
+}
+
+.narrative-text {
+  font-size: 1rem;
+  line-height: 1.8;
+  color: #5A4A5A;
+  margin: 0;
+  text-align: justify;
+  letter-spacing: 0.3px;
+  position: relative;
+  z-index: 1;
+}
+
+.narrative-placeholder .narrative-text {
+  color: #A68A8A;
+  font-style: italic;
+  opacity: 0.7;
+}
+
+/* 展开/收起按钮样式 */
+.toggle-messages-wrapper {
+  margin: 1rem 0;
+  display: flex;
+  justify-content: center;
+}
+
+.toggle-messages-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  background: rgba(255, 182, 193, 0.1);
+  border: 2px solid rgba(255, 182, 193, 0.3);
+  border-radius: 20px;
+  color: #8B6F7E;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.toggle-messages-btn::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+  transition: left 0.5s ease;
+}
+
+.toggle-messages-btn:hover {
+  background: rgba(255, 182, 193, 0.2);
+  border-color: rgba(255, 182, 193, 0.5);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(255, 182, 193, 0.2);
+}
+
+.toggle-messages-btn:hover::before {
+  left: 100%;
+}
+
+.toggle-messages-btn.expanded {
+  background: rgba(255, 182, 193, 0.15);
+  border-color: rgba(255, 182, 193, 0.4);
+}
+
+.toggle-icon {
+  font-size: 0.8rem;
+  transition: transform 0.3s ease;
+}
+
+.toggle-messages-btn.expanded .toggle-icon {
+  transform: rotate(0deg);
+}
+
+.toggle-text {
+  user-select: none;
+}
+</style>
+

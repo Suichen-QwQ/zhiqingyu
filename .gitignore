@@ -1,0 +1,79 @@
+# 栀情屿 —— 版本控制忽略规则
+#
+# 仓库里将来要放的是「能跑起来的源码」，所以这里只排除三类东西：
+#   1) 用户数据与密钥（绝不能进版本库）
+#   2) 运行时产物 / 缓存（能重新生成）
+#   3) 本地测试与排查痕迹（.eval/ 整个目录都是这一类）
+#
+# 注意：`frontend/assets/emotes/` 下的 352 张表情图是**要进库的**（线上要靠它渲染表情，
+# 丢了会导致模型永远不配表情且不报错），所以这里不排除 assets 目录。
+
+# ---------- 密钥与本地配置 ----------
+.env
+.env.local
+.env.secret
+*.env.secret
+settings.json
+!backend-live/.env.example
+!backend-live/.env.local.example
+
+# ---------- 用户数据 ----------
+# 用户的会话 / 日记 / 记忆 / 共同回忆 / 导出包，一律不进库
+storage/
+memories/
+recall/
+tts-cache/
+zqy-backups/
+*.zqy-archive.zip
+zqy-archive-*.zip
+.local-data/
+
+# ---------- 运行时产物 ----------
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.pid
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+htmlcov/
+deployed-static/
+node_modules/
+dist/
+build/
+.venv/
+venv/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# ---------- 本地测试与排查痕迹 ----------
+# .eval/ 下有 E2E 脚本、假上游、补丁脚本、截图和 *.bak 备份，全部是本机调试用
+.eval/
+tmp/
+tmp_*/
+*.bak
+*.bak-*
+*.orig
+*.rej
+
+# ---------- 部署临时文件 ----------
+*.tgz
+*.tar.gz
+live-emotes.tgz
+
+# Local databases and secrets
+*.db
+*.sqlite
+*.sqlite3
+.env.*
+!backend-live/.env.example
+!backend-live/.env.local.example

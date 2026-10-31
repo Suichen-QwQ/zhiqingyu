@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>语音诊断</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#F4F1EA;color:#3A4046;padding:20px;max-width:640px;margin:0 auto;line-height:1.6}
+  h2{font-size:18px;margin:18px 0 8px}
+  button{display:block;width:100%;padding:14px;margin:10px 0;border:none;border-radius:12px;background:#7BA7C4;color:#fff;font-size:16px}
+  button.gray{background:#8a9199}
+  #log{background:#fff;border:1px solid #E4E0D6;border-radius:12px;padding:12px;min-height:200px;font-size:13px;white-space:pre-wrap;word-break:break-all;margin-top:14px}
+  .ok{color:#2c7a4b}.bad{color:#b03a2e}.info{color:#4A6B84}
+  .env{background:#fff;border-radius:12px;padding:10px 14px;font-size:13px;border:1px solid #E4E0D6}
+</style>
+</head>
+<body>
+<h2>麦克风环境检测</h2>
+<div class="env" id="env">检测中…</div>
+
+<h2>测试1：录音层 getUserMedia</h2>
+<button onclick="tGum()">点我测试麦克风采集</button>
+<p style="font-size:12px;color:#7A828A;margin:4px 0">这是网站录音识别真正依赖的接口。点它浏览器可能弹授权框，请允许。</p>
+
+<h2>测试2：本机识别层 SpeechRecognition</h2>
+<button onclick="tSR()" class="gray">点我测试本机识别</button>
+<p style="font-size:12px;color:#7A828A;margin:4px 0">测 5 秒：说话或保持安静都行，主要看它报什么错。</p>
+
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function ts(){var d=new Date();return ('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2)+' ';}
+function add(msg,cls){var s=document.createElement('div');s.className=cls||'';s.textContent=ts()+msg;L.appendChild(s);}
+(function env(){
+  var e=document.getElementById('env');
+  var rows=[];
+  rows.push('协议: '+(location.protocol==='https:'?'https ✓':location.protocol+' ⚠️(非安全上下文，浏览器可能禁麦)'));
+  rows.push('isSecureContext: '+(window.isSecureContext?'true ✓':'false ✗'));
+  rows.push('getUserMedia 可用: '+(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia?'是 ✓':'否 ✗'));
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  rows.push('SpeechRecognition: '+(SR?'存在':'不存在'));
+  var ua=navigator.userAgent;
+  rows.push('浏览器: '+(/Quark/i.test(ua)?'夸克':/VivoBrowser/i.test(ua)?'Vivo浏览器':/HuaweiBrowser/i.test(ua)?'华为浏览器':/Chrome/i.test(ua)?'Chrome内核':'其他'));
+  e.innerHTML=rows.join('<br>');
+})();
+function tGum(){
+  add('── 测试1 开始：请求麦克风采集 ──','info');
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){add('✗ 这个浏览器连 getUserMedia 接口都没有','bad');return;}
+  add('getUserMedia 调用中…（若弹授权框请点允许）','info');
+  navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
+    var tracks=stream.getAudioTracks();
+    add('✓ 采集成功！音轨数='+tracks.length+'，标签='+(tracks[0]?tracks[0].label:'(无)')+'，状态='+(tracks[0]?tracks[0].readyState:'-'),'ok');
+    stream.getTracks().forEach(function(t){t.stop();});
+    add('（已停止采集，麦克风已归还）','info');
+  }).catch(function(err){
+    add('✗ 失败：'+err.name+' — '+(err.message||'无详细信息'),'bad');
+    if(err.name==='NotAllowedError')add('→ 含义：这一层被拒。若浏览器明明已允许，说明是浏览器内部第二层开关或内核限制','info');
+    if(err.name==='NotReadableError')add('→ 含义：麦克风被其他应用/进程占用','info');
+  });
+}
+function tSR(){
+  add('── 测试2 开始：本机识别 5 秒 ──','info');
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){add('✗ 无 SpeechRecognition','bad');return;}
+  var r=new SR(); var got=false;
+  r.lang='zh-CN'; r.continuous=false; r.interimResults=true;
+  r.onstart=function(){add('✓ onstart 触发（识别引擎已启动）','ok');};
+  r.onaudiostart=function(){add('✓ onaudiostart（音频通道建立）','ok');};
+  r.onsoundstart=function(){got=true;add('✓ onsoundstart（听到声音了）','ok');};
+  r.onresult=function(e){for(var i=0;i<e.results.length;i++){add('✓ 识别到: '+e.results[i][0].transcript,'ok');}};
+  r.onerror=function(e){add('✗ onerror: '+e.error+(e.error==='not-allowed'?'（这层报not-allowed≠麦克风真没权限）':''),'bad');};
+  r.onend=function(){add('── onend（引擎停止）'+(got?'':'，全程没听到声音')+' ──','info');};
+  try{r.start();add('start() 已调用，请说话…','info');}catch(e){add('✗ start() 直接抛异常: '+e.message,'bad');}
+  setTimeout(function(){try{r.stop();}catch(e){}},5000);
+}
+</script>
+</body>
+</html>
