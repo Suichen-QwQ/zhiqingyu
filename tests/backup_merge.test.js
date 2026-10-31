@@ -1,0 +1,12 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');const h=fs.readFileSync('frontend/index.html','utf8');
+const start=h.indexOf('    function mergeBackupData('),end=h.indexOf('    function selectBackupData(',start);const c={};vm.createContext(c);vm.runInContext(h.slice(start,end)+'\nthis.merge=mergeBackupData;',c);
+const local={sessions:[{id:'s',msgs:[{id:'a',text:'local edit'},{id:'local-only',text:'keep despite absent in backup'}]}],diary:{day:{manual:'local diary',items:[{ts:1}]}},meta:{name:'local'}};
+const incoming={sessions:[{id:'s',msgs:[{id:'a',text:'backup edit'},{id:'b',text:'new message'}]}],diary:{day:{manual:'backup diary',items:[{ts:2}]}},meta:{name:'backup',voice:'v'}};
+let id=0;const merged=c.merge(local,incoming,()=> 'copy'+(++id));
+assert(merged.sessions[0].msgs.some(x=>x.id==='b'));assert(merged.sessions[0].msgs.some(x=>x.id==='local-only'));
+assert.equal(merged.sessions[0].msgs.find(x=>x.id==='a').text,'local edit');
+assert(merged.sessions.some(x=>x.backupOf==='s'&&x.msgs.find(m=>m.id==='a').text==='backup edit'));
+assert(merged.diary.day.manual.includes('local diary')&&merged.diary.day.manual.includes('backup diary'));assert.equal(merged.diary.day.items.length,2);
+assert.equal(merged.meta.name,'local');assert.equal(merged.meta.voice,'v');
+const again=c.merge(merged,incoming,()=> 'copy'+(++id));assert.equal(again.sessions.length,merged.sessions.length);assert.equal(again.sessions[0].msgs.length,merged.sessions[0].msgs.length);
+assert.equal(local.sessions[0].msgs.length,2);console.log('same-session messages, edit conflicts and repeated backup merge passed');

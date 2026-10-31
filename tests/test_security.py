@@ -178,6 +178,49 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(imported['storage'], 'restored')
         self.assertEqual(real_read()['data']['sessions'][0]['msgs'], ['live'])
 
+    def test_service_without_model_key_starts_and_serves_settings(self):
+        import subprocess
+        import sys
+        import socket
+        import time
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        settings = DATA / 'unconfigured-settings.json'
+        settings.write_text(json.dumps({'base_url': 'https://custom.example/v1', 'api_key': ''}))
+        env = dict(os.environ, ZQY_SETTINGS_FILE=str(settings), ZQY_LISTEN_HOST='127.0.0.1', ZQY_LISTEN_PORT=str(port))
+        child = subprocess.Popen([sys.executable, str(ROOT / 'backend-live/chat_server.py')], env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                self.assertIsNone(child.poll(), 'unconfigured server exited')
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
+                try:
+                    conn.request('GET', '/api/settings')
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertFalse(json.loads(response.read())['has_key'])
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+                finally:
+                    conn.close()
+        finally:
+            child.terminate()
+            child.wait(timeout=4)
+
+    def test_missing_key_fails_before_model_network_request(self):
+        from unittest.mock import patch
+        candidate = {'api_key': ''}
+        with patch.object(server.urllib.request, 'build_opener', side_effect=AssertionError('network called')):
+            with self.assertRaises(server.LLMError):
+                server._chat_one(candidate, [], False)
+            with self.assertRaises(server.LLMError):
+                list(server._chat_stream_one(candidate, [], None, {}))
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

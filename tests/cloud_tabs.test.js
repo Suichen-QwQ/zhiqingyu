@@ -19,7 +19,7 @@ function tab(id){let timers=[],resolveFetch;const ctx={saveT:null,cloudT:null,sn
  let rendered=0;
  const ctx={DB:db,cloudState:'pending',cloudRevision:null,cloudUnsynced:()=>false,cloudSync:()=>{},
  fetch:async()=>({json:async()=>({revision:'v',data:{sessions:[],diary:{'2026-10-31':{manual:'valuable diary'}}}})}),
- window:{},localStorage:{setItem:()=>{}},normalizeDB:()=>{},profileId:()=>{},newSession:()=>db.sessions.push({id:'new',msgs:[]}),renderSession:()=>rendered++};
+ window:{},persistLocalSnapshot:()=>true,localStorage:{setItem:()=>{}},normalizeDB:()=>{},profileId:()=>{},newSession:()=>db.sessions.push({id:'new',msgs:[]}),renderSession:()=>rendered++};
  vm.createContext(ctx);vm.runInContext(html.slice(start,end),ctx);await new Promise(setImmediate);
  assert.equal(db.diary['2026-10-31'].manual,'valuable diary');assert.equal(ctx.cloudState,'restored');assert.equal(rendered,1);
  console.log('diary without sessions restoration regression passed');

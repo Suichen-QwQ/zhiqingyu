@@ -3404,6 +3404,8 @@ def _chat_stream_one(cand, messages, tools, _result, think=False):
       yield ('content',   片段)  —— 最终正文
     网关不认 tools 参数（function calling 不支持）→ 同一个模型去掉工具再试一次。
     """
+    if not cand.get('api_key'):
+        raise LLMError('模型服务未配置 API 密钥，请在设置中填写')
     _result['tool_calls'] = []
     _result['reasoning'] = ''
     # 上下文透明面板：记录本轮实际打到的模型（含备用模型的显示名）
@@ -3920,6 +3922,8 @@ def _chat_one(cand, messages, json_mode, max_tokens=2500, think=False, tools=Non
     + 单请求超时放宽；供应商不认识这些字段（400）时自动去掉重试，不影响生成。
     返回 dict：{'content': 正文, 'reasoning': 思考过程或 '', 'tool_calls': [...] 或 []}。
     """
+    if not cand.get('api_key'):
+        raise LLMError('模型服务未配置 API 密钥，请在设置中填写')
     settings = cand
     level = str(think_level or '').strip().lower()
     maxed = think and level == 'max'
@@ -6710,8 +6714,7 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 def main():
     if not model_settings().get('api_key'):
-        sys.stderr.write('ERROR: DEEPSEEK_API_KEY 未设置\n')
-        sys.exit(1)
+        sys.stderr.write('WARNING: 模型密钥未配置，请通过设置页面填写\n')
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     sys.stderr.write('ZhiQingYu /api/chat backend listening on %s:%d\n'
                      % (LISTEN_HOST, LISTEN_PORT))

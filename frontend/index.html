@@ -2230,13 +2230,27 @@
     return out;
   }
   function cloudUnsynced(){
-    try{return localStorage.getItem('zqy-cloud-unsynced')==='1'||Object.keys(cloudPendingRecords()).length>0;}catch(e){return false;}
+    try{return (cloudGeneration>0&&cloudSavedGeneration!==cloudGeneration)||localStorage.getItem('zqy-cloud-unsynced')==='1'||Object.keys(cloudPendingRecords()).length>0;}catch(e){return false;}
+  }
+  let pendingSavedGeneration=-1, localSavedGeneration=-1, cloudSavedGeneration=-1, storageWarningShown=false;
+  function localContentSaved(){return pendingSavedGeneration===cloudGeneration||localSavedGeneration===cloudGeneration;}
+  function saveFailureHint(){return localContentSaved()?'本机内容已保留':'内容尚未保存，请勿关闭页面，立即导出备份';}
+  if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('beforeunload',function(e){
+    if(cloudTracking&&!localContentSaved()&&cloudSavedGeneration!==cloudGeneration){e.preventDefault();e.returnValue='';}
+  });
+  function persistLocalSnapshot(){
+    try{localStorage.setItem('zqy-data',JSON.stringify(snapshot()));localSavedGeneration=cloudGeneration;storageWarningShown=false;return true;}
+    catch(e){
+      if(!localContentSaved()&&!storageWarningShown){showToast('本机存储不可用，请勿关闭页面，立即导出备份');storageWarningShown=true;}
+      return false;
+    }
   }
   function setCloudUnsynced(v){
     try{
-      if(v)localStorage.setItem(cloudPendingKey,JSON.stringify(snapshot()));
-      else {localStorage.removeItem(cloudPendingKey);localStorage.removeItem('zqy-cloud-unsynced');}
-    }catch(e){}
+      if(v){localStorage.setItem(cloudPendingKey,JSON.stringify(snapshot()));pendingSavedGeneration=cloudGeneration;}
+      else {localStorage.removeItem(cloudPendingKey);localStorage.removeItem('zqy-cloud-unsynced');pendingSavedGeneration=-1;}
+      return true;
+    }catch(e){return false;}
   }
   function cloudSync(){
     if(cloudState==='pending'||cloudState==='error'||cloudBusy) return;
@@ -2252,12 +2266,13 @@
         const result=await response.json();
         if(!response.ok||!result.ok){
           cloudState='error';
-          showToast(response.status===409?'云端数据已变化，本机内容已保留，请先导出备份':'云端保存失败，本机内容已保留');
+          showToast((response.status===409?'云端数据已变化，':'云端保存失败，')+saveFailureHint());
           return;
         }
         cloudRevision=result.revision;
+        cloudSavedGeneration=generation;
         if(generation===cloudGeneration) setCloudUnsynced(false);
-      }catch(e){ cloudState='error'; showToast('云端保存失败，本机内容已保留'); }
+      }catch(e){ cloudState='error'; showToast('云端保存失败，'+saveFailureHint()); }
       finally{
         cloudBusy=false;
         if(cloudState!=='error'&&generation!==cloudGeneration) cloudSync();
@@ -2269,7 +2284,7 @@
     if(saveT) clearTimeout(saveT);
     saveT=setTimeout(()=>{
       saveT=null;
-      try{localStorage.setItem('zqy-data',JSON.stringify(snapshot()));}catch(e){}
+      persistLocalSnapshot();
       cloudSync();
     },400);
   }
@@ -5220,6 +5235,36 @@
         showToast('已导出 JSON 备份');
       }catch(e){ showToast('导出失败，请重试'); }
     });
+    function mergeBackupData(local,incoming,makeId){
+      const clone=v=>JSON.parse(JSON.stringify(v));
+      const sessions=clone(local.sessions||[]);
+      for(const source of incoming.sessions||[]){
+        if(!source||!source.id)continue;
+        const target=sessions.find(s=>s.id===source.id);
+        if(!target){sessions.push(clone(source));continue;}
+        const original=new Map((target.msgs||[]).map(m=>[m.id,m]));
+        const conflict=(source.msgs||[]).some(m=>original.has(m.id)&&JSON.stringify(original.get(m.id))!==JSON.stringify(m));
+        if(conflict&&!sessions.some(s=>s.backupOf===source.id&&JSON.stringify(s.msgs)===JSON.stringify(source.msgs))){
+          const copy=clone(source);copy.id=makeId();copy.backupOf=source.id;copy.title=(copy.title||'对话')+'（备份冲突副本）';sessions.push(copy);
+        }
+        target.msgs=target.msgs||[];
+        for(const message of source.msgs||[])if(!original.has(message.id)){target.msgs.push(clone(message));original.set(message.id,message);}
+        target.updated=Math.max(Number(target.updated)||0,Number(source.updated)||0);
+      }
+      const diary=clone(local.diary||{});
+      const mergeText=(a,b)=>!a?b:(!b||a===b||a.includes('【备份版本】\n'+b)?a:a+'\n\n【备份版本】\n'+b);
+      for(const [day,source] of Object.entries(incoming.diary||{})){
+        if(!diary[day]){diary[day]=clone(source);continue;}
+        const target=diary[day];
+        for(const field of ['manual','narrative'])target[field]=mergeText(String(target[field]||''),String(source[field]||''));
+        if(target.mood&&source.mood&&target.mood!==source.mood)target.manual=mergeText(target.manual,'备份心情：'+source.mood);
+        else if(!target.mood)target.mood=source.mood;
+        const seen=new Set((target.items||[]).map(x=>JSON.stringify(x)));
+        target.items=target.items||[];
+        for(const item of source.items||[]){const key=JSON.stringify(item);if(!seen.has(key)){target.items.push(clone(item));seen.add(key);}}
+      }
+      return {sessions,diary,meta:Object.assign({},incoming.meta||{},local.meta||{})};
+    }
     function selectBackupData(backup,choose){
       const primary=backup.db||backup;
       const snapshots=Object.values(backup.pending_tabs||{}).filter(d=>d&&Array.isArray(d.sessions)&&d.diary&&typeof d.diary==='object');
@@ -5245,9 +5290,10 @@
             if(!selected)return;
             const data=selected.data;
             if(!Array.isArray(data.sessions)||!data.diary||typeof data.diary!=='object') throw new Error('format');
-            const overwrite=await zqyConfirm({title:'确定覆盖本机对话、日记和设置吗？',body:'取消则合并导入。',ok:'覆盖导入',cancel:'合并导入'});
+            const overwrite=await zqyConfirm({title:'确定覆盖本机对话、日记和设置吗？',body:'取消则合并：保留双方消息，不应用删除；消息内容冲突时另存备份会话副本。',ok:'覆盖导入',cancel:'合并导入'});
             if(overwrite){ DB.sessions=data.sessions; DB.diary=data.diary; DB.meta=data.meta||{}; DB.activeId=data.activeId; }
-            else { DB.sessions=DB.sessions.concat(data.sessions.filter(s=>s&&s.id&&!DB.sessions.some(x=>x.id===s.id))); DB.diary=Object.assign({},DB.diary,data.diary); }
+            else { const merged=mergeBackupData(DB,data,uid);DB.sessions=merged.sessions;DB.diary=merged.diary;DB.meta=merged.meta; }
+            normalizeDB();
             profileId(); if(!DB.sessions.length) newSession(); if(!DB.sessions.some(s=>s.id===DB.activeId)) DB.activeId=DB.sessions[0].id;
             const memOk=selected.primary?await memImport(backup,overwrite):true;   /* 优先 memory_v2，旧备份走 memory */
             dbSave(); refreshView(); showToast(overwrite?'备份已恢复':'备份已合并');
@@ -6905,7 +6951,8 @@
         const blob=(r&&r.data&&typeof r.data==='object')?r.data:null;
         if(!blob){ cloudState='empty'; if(cloudUnsynced()||hadLocal) cloudSync(); return; }   /* 云端没有数据 → 允许本地上推 */
         const hasCloudContent=(Array.isArray(blob.sessions)&&blob.sessions.some(s=>s&&Array.isArray(s.msgs)&&s.msgs.length))
-          ||Object.values(blob.diary||{}).some(d=>d&&((d.items&&d.items.length)||d.narrative||d.manual||d.mood));
+          ||Object.values(blob.diary||{}).some(d=>d&&((d.items&&d.items.length)||d.narrative||d.manual||d.mood))
+          ||Object.keys(blob.meta||{}).length>0;
         if(!hasCloudContent){
           cloudState='empty';
           if(hadLocal){
@@ -6929,7 +6976,7 @@
         DB.activeId=(blob.activeId&&DB.sessions.some(s=>s.id===blob.activeId))?blob.activeId:null;
         normalizeDB();   /* 云端旧数据同样规范化，避免渲染崩溃 */
         profileId(); if(!DB.sessions.length) newSession(); if(!DB.activeId&&DB.sessions.length) DB.activeId=DB.sessions[0].id;
-        try{localStorage.setItem('zqy-data',JSON.stringify({v:SCHEMA,sessions:DB.sessions,activeId:DB.activeId,diary:DB.diary,meta:DB.meta}));}catch(e){}
+        persistLocalSnapshot();
         cloudState='restored';   /* 云端内容已经装进 DB，之后写云端是安全的 */
         renderSession();
       }catch(e){ cloudState='error'; }   /* 重试 3 次仍读不到 → 允许写（见文件头注释） */
