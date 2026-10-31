@@ -1,0 +1,8 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');const html=fs.readFileSync('frontend/index.html','utf8');
+const start=html.indexOf('  function inboxSend('),end=html.indexOf('  function sendMsg(){',start),qStart=html.indexOf('  function flushQueue(){'),qEnd=html.indexOf('  /* ---- 从 DB 渲染',qStart);
+const a={id:'a',msgs:[]},b={id:'b',msgs:[]},DB={sessions:[a,b],activeId:'b'};let finish,save=0,sent=[];
+const ctx={DB,pendingQueue:[],typingVis:()=>false,dbSave:()=>save++,uid:()=> 'queued',window:{},showToast:()=>{},askYu:(text,id)=>sent.push({text,id}),fetch:()=>new Promise(r=>finish=r)};
+vm.createContext(ctx);vm.runInContext(html.slice(qStart,qEnd)+html.slice(start,end)+'\nthis.inbox=inboxSend;this.flush=flushQueue',ctx);
+(async()=>{ctx.inbox('a','late inbox');finish({ok:false,json:async()=>({error_code:'no_active_turn'})});await new Promise(setImmediate);
+ assert.equal(a.msgs[0].text,'late inbox');assert.equal(b.msgs.length,0);assert.equal(sent.length,0);assert(a.msgs[0].failed);DB.activeId='a';ctx.flush();assert.equal(sent[0].id,a.msgs[0].id);assert.equal(a.msgs.length,1);assert(!a.msgs[0].queued);assert(save);console.log('delayed inbox fallback stays in its original session passed');
+})().catch(e=>{console.error(e);process.exitCode=1});

@@ -296,6 +296,26 @@ class SecurityTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_archive_memory_import_shares_live_writer_lock(self):
+        from concurrent.futures import ThreadPoolExecutor
+        path = DATA / 'memory' / 'archive-race.json'
+        path.parent.mkdir(exist_ok=True)
+        started, finished = threading.Event(), threading.Event()
+        def importing():
+            started.set()
+            result = server._archive_write(str(path), '{"items":[]}', False)
+            finished.set()
+            return result
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with server.MEM_LOCK:
+                future = pool.submit(importing)
+                self.assertTrue(started.wait(3))
+                self.assertFalse(finished.wait(0.1))
+                path.write_text('{"items":[{"text":"live memory"}]}')
+            self.assertEqual(future.result(timeout=3), 'skipped_exists')
+        self.assertIn('live memory', path.read_text())
+        self.assertEqual(list(path.parent.glob('.zqy-import-*.tmp')), [])
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

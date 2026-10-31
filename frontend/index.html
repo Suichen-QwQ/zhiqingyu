@@ -2168,6 +2168,7 @@
   const sesUid=()=>'s_'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
   function allMsgs(){ const r=[]; DB.sessions.forEach(s=>{ if(s.msgs) r.push.apply(r,s.msgs); }); return r; }
     function newSession(title){
+      if(window.zqyCancelChat)window.zqyCancelChat();
       if(window.zqyTts) window.zqyTts.stop();   /* 开新对话：先停下正在朗读的语音 */
       const id=sesUid();
       const n={id:id,title:title||'新对话',created:Date.now(),updated:Date.now(),summary:'',summary_meta:null,msgs:[]};
@@ -2184,10 +2185,12 @@
     return f?f.text.slice(0,14):('对话 '+(DB.sessions.indexOf(s)+1));
   }
   function setActive(id){
+    if(id!==DB.activeId&&window.zqyCancelChat)window.zqyCancelChat();
     if(window.zqyTts) window.zqyTts.stop();   /* 切历史会话：不接着念上一条会话的语音 */
     DB.activeId=id; dbSave();
   }
   function removeSession(id){
+    if(window.zqyCancelChat)window.zqyCancelChat(id);
     if(window.zqyTts) window.zqyTts.stop();   /* 删会话：先停下这条会话的语音 */
     const i=DB.sessions.findIndex(s=>s.id===id);
     if(i<0) return;
@@ -2401,6 +2404,7 @@
     }
   }
    function dbReset(){
+    if(window.zqyCancelChat)window.zqyCancelChat();
     if(window.zqyTts) window.zqyTts.stop();   /* 清空全部数据：语音一并停下 */
     DB.sessions=[];DB.diary={};DB.meta={};DB.activeId=null;
     try{localStorage.removeItem('zqy-data');}catch(e){}
@@ -2809,13 +2813,32 @@
   msgsBox.addEventListener('scroll',syncToLatest,{passive:true});
   if(toLatestEl) toLatestEl.addEventListener('click',()=>{jumpLatest(true);inputEl.focus();});
   let activeRequest=null;
+  window.zqyCancelChat=function(sessionId){
+    const req=activeRequest;
+    if(!req||(sessionId&&req.sessionId!==sessionId))return;
+    req.stopped=true;req.sessionChanged=true;req.ctrl.abort();
+    if(req.partialMessage&&req.partialMessage.text&&DB.sessions.includes(req.sourceSession)){
+      req.sourceSession.msgs.push(req.partialMessage);req.partialSaved=true;dbSave();
+    }
+    activeRequest=null;
+    typingEl.style.display='none';thinkEl.classList.remove('on');
+    if(stopEl)stopEl.hidden=true;if(sendEl)sendEl.hidden=false;
+  };
   const typingVis=()=>!!activeRequest||typingEl.style.display!=='none';
   let pendingQueue=[];
   function flushQueue(){
-    if(pendingQueue.length&&!typingVis()){
-      const t=pendingQueue.shift();
-      inputEl.value=t;sendMsg();
-    }
+    if(typingVis())return;
+    pendingQueue=pendingQueue.filter(q=>{
+      const session=DB.sessions.find(s=>s.id===q.sid);
+      return session&&session.msgs.some(m=>m.id===q.id&&m.queued);
+    });
+    const index=pendingQueue.findIndex(q=>q.sid===DB.activeId);
+    if(index<0)return;
+    const q=pendingQueue.splice(index,1)[0],session=DB.sessions.find(s=>s.id===q.sid);
+    const message=session.msgs.find(m=>m.id===q.id);
+    delete message.queued;message.failed=false;dbSave();
+    if(window.zqyRenderSession)window.zqyRenderSession();
+    askYu(q.text,q.id);
   }
   /* ---- 从 DB 渲染消息流（刷新后恢复） ---- */
   function tsText(ms){const d=new Date(ms);return pad(d.getHours())+':'+pad(d.getMinutes());}
@@ -3703,6 +3726,7 @@
     return out;
   }
   async function askYu(text,id,avoid){
+    const requestSession=curSess(), requestMessages=requestSession.msgs;
     typingEl.querySelector('.typing-label').textContent='正在回应';
     typingEl.style.display='inline-flex';
     /* 「深度思考中」提示动画已按用户要求移除；thinkEl 保留仅作消息插入锚点 */
@@ -3710,34 +3734,35 @@
     /* emote 必带：后端要反查「你最近配过哪几张图」，模型才能主动换一张。
        不带的话模型对自己上一轮发了什么图零感知，会反复挑同一个熟词
        （实测跨会话反复出现同一张）。后端 recent_emote_note() 消费它。 */
-    const hist=DB.msgs.filter(m=>m.id!==id&&!m.failed).slice(-20).map(m=>({role:m.role,text:m.text,ts:m.ts,emo:m.emo,theme:m.theme,emote:m.emote}));
+    const hist=requestMessages.filter(m=>m.id!==id&&!m.failed).slice(-20).map(m=>({role:m.role,text:m.text,ts:m.ts,emo:m.emo,theme:m.theme,emote:m.emote}));
     /* P7 会话摘要记账：摘要只折「已经滑出逐字窗口」的消息——窗口内那 20 条本来就会原样进
        prompt，再抄进摘要就是纯重复（老实现每轮都重复一遍）。covered_upto 记着上一轮折到哪条。 */
-    const _sm=(curSess().summary_meta&&typeof curSess().summary_meta==='object')?curSess().summary_meta:{};
-    const _base=DB.msgs.filter(x=>x.id!==id&&!x.failed);
+    const _sm=(requestSession.summary_meta&&typeof requestSession.summary_meta==='object')?requestSession.summary_meta:{};
+    const _base=requestMessages.filter(x=>x.id!==id&&!x.failed);
     const _win=Math.max(0,_base.length-20);   /* 逐字窗口起点，与 hist 的 slice(-20) 同口径 */
     let _start=0;
     const _ci=_sm.covered_upto?_base.findIndex(x=>x.id===_sm.covered_upto):-1;
     if(_ci>=0) _start=_ci+1; else _start=Math.min(Number(_sm.folded)||0,_base.length);
     const folded=_base.slice(_start,_win).slice(-40).map(x=>({id:x.id,role:x.role,text:x.text}));
-    const payload={message:text,history:hist,summary:(curSess().summary||''),profile_id:profileId(),
+    const payload={message:text,history:hist,summary:(requestSession.summary||''),profile_id:profileId(),
       folded:folded,folded_total:_win,summary_meta:_sm,memory_citations:true,
       /* session_id 必带：后端靠它把「回合中插话」挂到这一轮上；
          不带就等于把插话能力静默关掉了（前端留了这个口子才有人知道）*/
-      session_id:(curSess()&&curSess().id)||'',
+      session_id:(requestSession&&requestSession.id)||'',
       persona:personaPayload(),user:userPayload(),stream:true,...toolPayload()};
     const tmp=consumeTmp();
     if(tmp.think!==undefined) payload.think=tmp.think;
     if(tmp.search!==undefined) payload.search=tmp.search;
     if(avoid) payload.avoid=avoid;
     const ctrl=new AbortController(), limit=(payload.think||payload.search)?70000:30000;
-    const req={ctrl:ctrl,stopped:false,timedOut:false}; activeRequest=req;
+    const req={ctrl:ctrl,stopped:false,timedOut:false,sessionId:requestSession.id}; activeRequest=req;
     if(sendEl) sendEl.hidden=true;
     if(stopEl) stopEl.hidden=false;
     /* 墙钟兜底也要留下来源：它不是用户点的停止，不能和「已停止生成」混为一谈。 */
     const tmr=setTimeout(()=>{ req.timedOut=true; ctrl.abort(); },limit);
     const withTide=Math.random()>0.4;
     const m={id:uid(),role:'ai',text:'',ts:Date.now(),emo:'平静',theme:'',tide:withTide,partnerName:payload.persona.name||''};
+    req.partialMessage=m;req.sourceSession=requestSession;
     let el=null, done=null, errData=null, completed=false;
     /* 用同一个等待提示显示思考或搜索状态，正文开始后立即收起。 */
     const showNote=(label)=>{
@@ -3749,7 +3774,7 @@
       if(!res.ok) throw new Error('HTTP '+res.status);
       const reader=res.body.getReader(), decoder=new TextDecoder(); let buf='';
       while(true){
-        const part=await reader.read(); if(part.done) break;
+        const part=await reader.read(); if(req.stopped)throw new DOMException('Stopped','AbortError'); if(part.done) break;
         buf+=decoder.decode(part.value,{stream:true});
         let cut; while((cut=buf.indexOf('\n\n'))>=0){
           const block=buf.slice(0,cut); buf=buf.slice(cut+2);
@@ -3812,7 +3837,7 @@
           else if(type==='error'){ errData=data; }
         }
       }
-      if(req.stopped) return;
+      if(req.stopped)throw new DOMException('Stopped','AbortError');
       /* 模型链全挂：后端先发 event:error、再发 done{failed:true}。
          保留已经流出来的半截正文，其余交给提示气泡（不再编默认回复）。 */
       const bad=errData||(done&&done.failed?done:null);
@@ -3825,8 +3850,8 @@
         if(m.text){
           /* 半截正文会留在历史里，那就把这次的风险卡一起存下来，重开页面还能看到求助资源 */
           if(badRisk) m.risk=badRisk;
-          DB.msgs.push(m);
-          const s0=DB.msgs.find(x=>x.id===id);
+          requestMessages.push(m);
+          const s0=requestMessages.find(x=>x.id===id);
           if(s0){ s0.failed=false; s0.emo=m.emo; s0.theme=m.theme; }
           dbSave();
         }else if(el){ el.remove(); el=null; }
@@ -3852,35 +3877,37 @@
       enterMessageParts(finalEl,previous);
       if(follow)followMessageGrowth(finalEl);
       el=finalEl;
-      DB.msgs.push(m); const src=DB.msgs.find(x=>x.id===id);
+      requestMessages.push(m); const src=requestMessages.find(x=>x.id===id);
       if(src){ src.failed=false; src.emo=m.emo; src.theme=m.theme; src.emote=m.emote; }
-      curSess().summary=done.summary||curSess().summary||'';
-      if(done.summary_meta&&typeof done.summary_meta==='object') curSess().summary_meta=done.summary_meta;
+      requestSession.summary=done.summary||requestSession.summary||'';
+      if(done.summary_meta&&typeof done.summary_meta==='object') requestSession.summary_meta=done.summary_meta;
       pushDiaryItem(todayKey(),{theme:m.theme,emo:m.emo,partnerName:m.partnerName},m.ts); dbSave();
       renderLive(); renderCal(); refreshStats(); completed=true;
       scrollChat(true);   // 有新回复：立即把这条回复滚到可见位置（即使生成期间用户滚走了）
       if(window.zqyTts&&window.zqyTts.auto) window.zqyTts.auto(m.id,m.text);   /* 开关打开时自动朗读这条回复 */
-      if(window.zqyAutoTitle) window.zqyAutoTitle(curSess());
+      if(window.zqyAutoTitle) window.zqyAutoTitle(requestSession);
     }catch(err){
       const aborted=(err&&err.name==='AbortError');
       if(req.stopped){
         /* 1) 用户主动点的停止：保留已生成的半截正文，如实提示 */
-        if(m.text){ DB.msgs.push(m); dbSave(); } else if(el){ el.remove(); }
-        showToast('已停止生成');
+        if(m.text){ if(!req.partialSaved){requestMessages.push(m);dbSave();} } else if(el){ el.remove(); }
+        if(!req.sessionChanged)showToast('已停止生成');
       } else if(aborted){
         /* 2)/3) 墙钟兜底或连接断流：不是用户停的，绝不能显示「已停止生成」，
            否则用户以为是自己停的，也就不会去点重试。保留半截正文 + 可重试提示。 */
-        if(m.text){ DB.msgs.push(m); dbSave(); } else if(el){ el.remove(); el=null; }
+        if(m.text){ requestMessages.push(m); dbSave(); } else if(el){ el.remove(); el=null; }
         showErrBubble(id, req.timedOut
           ? '这次等太久了，我先停下来了，点重试再来一次'
           : '连接中途断了，点重试再来一次', '', null);
       } else markFailed(id);
     }finally{
-      clearTimeout(tmr); typingEl.style.display='none'; thinkEl.classList.remove('on');
-      if(stopEl) stopEl.hidden=true;
-      if(sendEl) sendEl.hidden=false;
-      if(activeRequest===req) activeRequest=null;
-      if(completed) flushQueue();
+      clearTimeout(tmr);
+      if(activeRequest===req){
+        typingEl.style.display='none';thinkEl.classList.remove('on');
+        if(stopEl)stopEl.hidden=true;if(sendEl)sendEl.hidden=false;
+        activeRequest=null;
+        if(completed)flushQueue();
+      }
     }
   }
   /* ===== 表情包：鸣潮官方表情（assets/emotes/）===== */
@@ -3988,8 +4015,15 @@
   function inboxSend(sid,text){
     const body={session_id:String(sid||''),message:String(text||'')};
     const fallback=function(hint){
-      pendingQueue.push(text);
-      if(hint) showToast(hint);
+      const session=DB.sessions.find(s=>s.id===sid);
+      if(!session)return;
+      const message={id:uid(),role:'me',text:text,ts:Date.now(),failed:true,queued:true};
+      session.msgs.push(message);pendingQueue.push({sid:sid,id:message.id,text:text});dbSave();
+      if(DB.activeId===sid){
+        if(window.zqyRenderSession)window.zqyRenderSession();
+        if(hint)showToast(hint);
+        flushQueue();
+      }
     };
     fetch('api/inbox',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(body)})
@@ -4048,7 +4082,7 @@
     if(!m||typingVis()) return;
     b.classList.remove('failed');
     r.remove();
-    m.failed=false; dbSave();
+    m.failed=false;delete m.queued;dbSave();
     askYu(m.text,id);
   });
   /* ===== 消息级操作：复制 / 重来 / 删除 ===== */
@@ -5326,6 +5360,7 @@
             const data=selected.data;
             if(!Array.isArray(data.sessions)||!data.diary||typeof data.diary!=='object') throw new Error('format');
             const overwrite=await zqyConfirm({title:'确定覆盖本机对话、日记和设置吗？',body:'取消则合并：保留双方消息，不应用删除；消息内容冲突时另存备份会话副本。',ok:'覆盖导入',cancel:'合并导入'});
+            if(window.zqyCancelChat)window.zqyCancelChat();
             if(overwrite){ DB.sessions=data.sessions; DB.diary=data.diary; DB.meta=data.meta||{}; DB.activeId=data.activeId; }
             else { const merged=mergeBackupData(DB,data,uid);DB.sessions=merged.sessions;DB.diary=merged.diary;DB.meta=merged.meta; }
             normalizeDB();
@@ -7005,6 +7040,7 @@
           }
           setCloudUnsynced(false);
         }
+        if(window.zqyCancelChat)window.zqyCancelChat();
         DB.sessions=Array.isArray(blob.sessions)?blob.sessions:[];
         DB.diary=(blob.diary&&typeof blob.diary==='object')?blob.diary:{};
         DB.meta=(blob.meta&&typeof blob.meta==='object')?blob.meta:{};

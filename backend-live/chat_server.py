@@ -5715,19 +5715,23 @@ def _archive_key(name):
 
 
 def _archive_write(path, text, force):
-    if os.path.exists(path) and not force:
-        return 'skipped_exists'
-    try:
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, exist_ok=True)
-    except OSError:
-        pass
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        f.write(strip_lone_surrogates(text))
-    os.replace(tmp, path)
-    return 'restored'
+    # Importers must share the same lock as live memory/recall updates.
+    lock = MEM_LOCK if os.path.realpath(os.path.dirname(path)) == os.path.realpath(MEMORY_DIR) else _RECALL_LOCK
+    with lock:
+        if os.path.exists(path) and not force:
+            return 'skipped_exists'
+        import tempfile
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.zqy-import-', suffix='.tmp', dir=directory)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(strip_lone_surrogates(text))
+            os.replace(tmp, path)
+            return 'restored'
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
 
 def archive_import(blob, force=False):
