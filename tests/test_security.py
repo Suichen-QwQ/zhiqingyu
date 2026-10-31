@@ -38,6 +38,9 @@ class SecurityTests(unittest.TestCase):
         cls.thread.join()
         TEMP.cleanup()
 
+    def setUp(self):
+        (DATA / 'storage.json').write_text(json.dumps({'data': {'sessions': [{'msgs': ['private-test']}]}}))
+
     def request(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=4)
         conn.request(method, path, body=body, headers=headers or {})
@@ -66,6 +69,53 @@ class SecurityTests(unittest.TestCase):
         body = json.dumps({'base_url': 'http://127.0.0.1:19992'}).encode()
         status, _, _ = self.request('POST', '/api/settings/test', body, {'Content-Type': 'application/json'})
         self.assertEqual(status, 400)
+
+    def test_stale_writes_are_rejected_without_losing_winner(self):
+        status, _, body = self.request('GET', '/api/storage')
+        revision = json.loads(body)['revision']
+        def write(text, version):
+            payload = {'expected_revision': version, 'data': {'sessions': [{'msgs': [text]}]}}
+            return self.request('POST', '/api/storage', json.dumps(payload).encode(), {'Content-Type': 'application/json'})
+        first = write('first', revision)
+        self.assertEqual(first[0], 200)
+        second = write('stale', revision)
+        self.assertEqual(second[0], 409)
+        self.assertEqual(json.loads(second[2])['error_code'], 'storage_conflict')
+        self.assertEqual(json.loads(self.request('GET', '/api/storage')[2])['data']['sessions'][0]['msgs'], ['first'])
+
+    def test_simultaneous_clients_cannot_overwrite_each_other(self):
+        from concurrent.futures import ThreadPoolExecutor
+        revision = json.loads(self.request('GET', '/api/storage')[2])['revision']
+        def write(value):
+            payload = {'expected_revision': revision, 'data': {'sessions': [{'msgs': [value]}]}}
+            return self.request('POST', '/api/storage', json.dumps(payload).encode(), {'Content-Type': 'application/json'})[0]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            statuses = list(pool.map(write, ['a', 'b']))
+        self.assertEqual(sorted(statuses), [200, 409])
+
+    def test_revision_required(self):
+        status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
+        self.assertEqual(status, 428)
+
+    def test_fallback_different_host_does_not_receive_primary_key(self):
+        from unittest.mock import patch
+        fallback = server._chain_entry({'id': 'fb1', 'base_url': 'https://other.example/v1', 'model': 'm', 'api_key': ''})
+        with patch.object(server, 'saved_fallbacks', return_value=[fallback]):
+            self.assertEqual(len(server.model_chain()), 1)
+        fallback['base_url'] = server.BASE_URL
+        with patch.object(server, 'saved_fallbacks', return_value=[fallback]):
+            self.assertEqual(server.model_chain()[1]['api_key'], 'fake-review-key')
+
+    def test_changing_primary_host_requires_new_key(self):
+        with self.assertRaises(ValueError):
+            server.save_model_settings({'base_url': 'https://other.example/v1'})
+
+    def test_concurrent_writes_use_independent_temp_files(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda i: server.put_storage({'value': i}), range(16)))
+        self.assertTrue(all(results))
+        self.assertIn(server.read_storage()['data']['value'], range(16))
 
     def test_oversized_content_length_rejected_before_body(self):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=4)

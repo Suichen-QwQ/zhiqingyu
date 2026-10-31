@@ -2215,17 +2215,37 @@
      只有 restored / empty（明确知道云端内容）才允许写。
      error 也不写，是因为「读不到就写」等于用本机残缺数据覆盖云端真数据 ——
      只丢一段会话，永远好过丢全部。 */
-  let cloudState='pending';
+  let cloudState='pending', cloudRevision=null, cloudBusy=false, cloudGeneration=0, cloudTracking=false;
+  function cloudUnsynced(){ try{return localStorage.getItem('zqy-cloud-unsynced')==='1';}catch(e){return false;} }
+  function setCloudUnsynced(v){ try{if(v)localStorage.setItem('zqy-cloud-unsynced','1');else localStorage.removeItem('zqy-cloud-unsynced');}catch(e){} }
   function cloudSync(){
-    if(cloudState==='pending'||cloudState==='error') return;   /* 没读到云端内容，绝不写 */
+    if(cloudState==='pending'||cloudState==='error'||cloudBusy) return;
     if(cloudT) clearTimeout(cloudT);
     cloudT=setTimeout(async()=>{
       cloudT=null;
-      if(cloudState==='pending'||cloudState==='error') return;
-      try{ await fetch('api/storage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:snapshot()})}); }catch(e){}
+      if(cloudState==='pending'||cloudState==='error'||cloudBusy) return;
+      cloudBusy=true;
+      const generation=cloudGeneration;
+      try{
+        const response=await fetch('api/storage',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({data:snapshot(),expected_revision:cloudRevision})});
+        const result=await response.json();
+        if(!response.ok||!result.ok){
+          cloudState='error';
+          showToast(response.status===409?'云端数据已变化，本机内容已保留，请先导出备份':'云端保存失败，本机内容已保留');
+          return;
+        }
+        cloudRevision=result.revision;
+        if(generation===cloudGeneration) setCloudUnsynced(false);
+      }catch(e){ cloudState='error'; showToast('云端保存失败，本机内容已保留'); }
+      finally{
+        cloudBusy=false;
+        if(cloudState!=='error'&&generation!==cloudGeneration) cloudSync();
+      }
     },900);
   }
   function dbSave(){
+    if(cloudTracking){ cloudGeneration++; setCloudUnsynced(true); }
     if(saveT) clearTimeout(saveT);
     saveT=setTimeout(()=>{
       saveT=null;
@@ -2351,6 +2371,7 @@
      return DB.meta.profileId;
    }
    profileId();
+   cloudTracking=true;
 
   /* === 首次使用引导（onboard）：还没说过「知道了」就显示，一次点击后存 meta.onboard === */
   (function onboardInit(){
@@ -4902,7 +4923,8 @@
       if(kind==='ok')  ic='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 12.5 9 17.5 20 6.5"/></svg>';
       if(kind==='bad') ic='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 17h.01"/></svg>';
       mdSt.className='md-st'+(kind?' '+kind:'');
-      mdSt.innerHTML=ic+'<span>'+text+'</span>';
+      mdSt.innerHTML=ic+'<span></span>';
+      mdSt.querySelector('span').textContent=text;
     }
     function mdHint(){
       const other=MD.hasKey&&mdHost(mdUrl.value)!==MD.host;
@@ -4924,8 +4946,7 @@
       mdKeySaved.hidden=false; mdKeyEdit.hidden=true;
       const txt=mdKeySaved.querySelector('.mk-txt');
       if(MD.hasKey){
-        txt.innerHTML='已保存 <code>sk-••••••••'+(MD.tail||'')+'</code>'+
-          (MD.from==='server'?'<span class="mk-src">（服务器默认）</span>':'');
+        txt.textContent='已保存 sk-••••••••'+(MD.tail||'')+(MD.from==='server'?'（服务器默认）':'');
       }else{
         txt.textContent='未设置 Key，使用服务器默认';
       }
@@ -5040,7 +5061,7 @@
           mdEditing=false; mdClear=false; mdKey.value=''; mdKey.placeholder=MD_PH;
           mdPaintKey(); mdStatus('','未测试'); fbRender(out.fallbacks||[]);
           showToast('模型设置已保存');
-        }else{ showToast('模型设置保存失败'); }
+        }else{ showToast((out&&out.error)||'模型设置保存失败'); }
       }catch(e){ showToast('暂时无法保存模型设置'); }
     });
     /* ---- 备用模型：首选失败时按顺序自动顺延 ---- */
@@ -6793,11 +6814,25 @@
     const wipeCancel=document.getElementById('wipeCancel');
     const wipeClose=document.getElementById('wipeClose');
     if(wipeMask&&wipeConfirm){
-      wipeConfirm.addEventListener('click',async()=>{ wipeMask.hidden=true; closeDrawer(); if(window.zqyCloseSettings) window.zqyCloseSettings(); await fetch('api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear',profile_id:profileId()})}).catch(()=>{}); dbReset();
-        /* 云端 storage 也一并清空：否则刷新后 cloudRestore 会从云端恢复旧数据（数据量大时渲染卡死、且清空无效） */
-        /* clear:true 是对后端「拒绝用空库覆盖非空云端」守卫的显式授权（2026-10-30 加） */
-        try{ await fetch('api/storage',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clear:true,data:{v:SCHEMA,sessions:[],activeId:null,diary:{},meta:{}}})}); }catch(e){}
-        renderSession(); showToast('已清空本机数据与记忆'); });
+      wipeConfirm.addEventListener('click',async()=>{
+        if(cloudBusy||cloudState==='pending'||cloudState==='error'){
+          showToast('云端状态未确认，已保留数据；请先导出备份'); return;
+        }
+        if(cloudT) {clearTimeout(cloudT);cloudT=null;}
+        cloudBusy=true;
+        try{
+          const response=await fetch('api/storage',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({clear:true,expected_revision:cloudRevision,data:{v:SCHEMA,sessions:[],activeId:null,diary:{},meta:{}}})});
+          const result=await response.json();
+          if(!response.ok||!result.ok){cloudState='error';showToast('云端数据已变化或清空失败，已保留本机数据');return;}
+          cloudRevision=result.revision;
+          await fetch('api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear',profile_id:profileId()})}).catch(()=>{});
+          dbReset(); setCloudUnsynced(false);
+          wipeMask.hidden=true; closeDrawer(); if(window.zqyCloseSettings) window.zqyCloseSettings();
+          renderSession(); showToast('已清空本机数据与记忆');
+        }catch(e){cloudState='error';showToast('清空失败，已保留本机数据');}
+        finally{cloudBusy=false;}
+      });
       if(wipeCancel) wipeCancel.addEventListener('click',()=>{ wipeMask.hidden=true; });
       if(wipeClose) wipeClose.addEventListener('click',()=>{ wipeMask.hidden=true; });
       wipeMask.addEventListener('click',e=>{ if(e.target===wipeMask) wipeMask.hidden=true; });
@@ -6822,9 +6857,10 @@
           try{ r=await fetch('api/storage').then(x=>x.json()); break; }
           catch(e){ if(cloudRetry<2) await new Promise(function(z){ setTimeout(z, 1000*(cloudRetry+1)); }); }
         }
-        if(!r) throw new Error('storage unreachable');
+        if(!r || !Object.prototype.hasOwnProperty.call(r,'revision')) throw new Error('storage unreachable');
+        cloudRevision=r.revision;
         const blob=(r&&r.data&&typeof r.data==='object')?r.data:null;
-        if(!blob){ cloudState='empty'; return; }   /* 云端没有数据 → 允许本地上推 */
+        if(!blob){ cloudState='empty'; if(cloudUnsynced()||hadLocal) cloudSync(); return; }   /* 云端没有数据 → 允许本地上推 */
         if(!Array.isArray(blob.sessions)||!blob.sessions.length){
           cloudState='empty';
           if(hadLocal){
@@ -6833,6 +6869,14 @@
           }
           cloudState='empty';
           return;           /* 两边都空 → 无事可做 */
+        }
+        if(cloudUnsynced()){
+          if(!window.confirm('本机有未同步内容，加载云端会覆盖这些本地更改。请先导出备份。确认已备份并加载云端？')){
+            cloudState='error';
+            showToast('本机未同步内容已保留，云端同步已暂停');
+            return;
+          }
+          setCloudUnsynced(false);
         }
         DB.sessions=Array.isArray(blob.sessions)?blob.sessions:[];
         DB.diary=(blob.diary&&typeof blob.diary==='object')?blob.diary:{};

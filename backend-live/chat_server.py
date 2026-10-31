@@ -1790,14 +1790,20 @@ def memory_snapshot(profile_id):
     return out
 
 
+STORAGE_LOCK = threading.RLock()
+
+
 def read_storage():
     """读取云端整包 → {'data': <blob|null>, 'updated': <str|null>}；无文件/损坏 → {data:None, updated:None}。"""
     try:
-        with open(STORAGE_FILE, 'r', encoding='utf-8') as f:
-            blob = json.load(f)
-        return {'data': blob.get('data'), 'updated': blob.get('updated')}
-    except Exception:
-        return {'data': None, 'updated': None}
+        with open(STORAGE_FILE, 'rb') as f:
+            raw = f.read()
+        blob = json.loads(raw.decode('utf-8'))
+        return {'data': blob.get('data'), 'updated': blob.get('updated'),
+                'revision': hashlib.sha256(raw).hexdigest()}
+    except FileNotFoundError:
+        return {'data': None, 'updated': None, 'revision': None}
+
 
 
 def _storage_is_empty(data):
@@ -1820,18 +1826,27 @@ def _storage_is_empty(data):
 
 
 def put_storage(data):
-    """原子写云端整包（临时文件 + os.replace）。成功 → updated 时间戳，失败 → None。"""
-    try:
-        os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
-        stamp = time.strftime('%Y-%m-%dT%H:%M:%S')
-        blob = {'v': 1, 'updated': stamp, 'data': data}
-        tmp = STORAGE_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json_dump(blob, f, ensure_ascii=False)
-        os.replace(tmp, STORAGE_FILE)
-        return stamp
-    except Exception:
-        return None
+    """Write atomically while serializing writers, including archive imports."""
+    with STORAGE_LOCK:
+        tmp = None
+        try:
+            import tempfile
+            os.makedirs(os.path.dirname(STORAGE_FILE), exist_ok=True)
+            stamp = time.strftime('%Y-%m-%dT%H:%M:%S')
+            blob = {'v': 1, 'updated': stamp, 'data': data}
+            fd, tmp = tempfile.mkstemp(prefix='.zqy-', suffix='.tmp', dir=os.path.dirname(STORAGE_FILE))
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json_dump(blob, f, ensure_ascii=False)
+            os.replace(tmp, STORAGE_FILE)
+            return stamp
+        except Exception:
+            return None
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
 
 def search_metadata(results, attempted=False):
@@ -2307,7 +2322,7 @@ def merge_fallbacks(raw_list):
     只有显式 clear_key=true 才清空。
     """
     old = saved_fallbacks()
-    by_id = dict((e['id'], e['api_key']) for e in old)
+    by_id = dict((e['id'], e) for e in old)
     by_sig = dict(((e['base_url'], e['model']), e['api_key']) for e in old)
     out, seen = [], set()
     if not isinstance(raw_list, list):
@@ -2326,7 +2341,9 @@ def merge_fallbacks(raw_list):
         elif item.get('clear_key'):
             ent['api_key'] = ''
         else:
-            ent['api_key'] = by_id.get(ent['id']) or by_sig.get(sig, '')
+            previous = by_id.get(ent['id'])
+            ent['api_key'] = (previous['api_key'] if previous and previous['base_url'] == ent['base_url']
+                              else by_sig.get(sig, ''))
         out.append(ent)
         if len(out) >= MAX_FALLBACKS:
             break
@@ -2345,6 +2362,8 @@ def model_chain():
     for ent in saved_fallbacks():
         if ent['base_url'] == p['base_url'] and ent['model'] == p['model']:
             continue                                   # 与首选完全重复
+        if not ent['api_key'] and ent['base_url'] != p['base_url']:
+            continue  # Never send the primary credential to another service.
         chain.append({'label': ent['label'] or _host_label(ent['base_url']),
                       'base_url': ent['base_url'], 'model': ent['model'],
                       'reasoner_model': ent['reasoner_model'],
@@ -2461,6 +2480,9 @@ def save_model_settings(data):
     缺省或空串=保持原样（前端不会因为回显不了明文而误清 Key）。
     """
     current = model_settings()
+    requested_base = str(data.get('base_url') or current['base_url']).strip().rstrip('/')
+    if requested_base != current['base_url'] and not str(data.get('api_key') or '').strip():
+        raise ValueError('A new API key is required when changing the model service address')
     for key in ('base_url', 'model', 'reasoner_model', 'timeout'):
         if key in data:
             current[key] = data[key]
@@ -6394,23 +6416,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if re.search(r'/api/storage$', self.path):
                 _data = payload.get('data')
-                # 2026-10-30 事故守卫：拒绝用空库覆盖非空云端。
-                # 前端「清空全部数据」会显式带 clear:true 表示这是用户意图。
-                if _storage_is_empty(_data) and not payload.get('clear'):
-                    _cur = read_storage().get('data')
-                    if not _storage_is_empty(_cur):
-                        self._send(409, {
-                            'ok': False,
-                            'error': 'refuse to overwrite non-empty storage with empty data',
-                            'error_code': 'empty_overwrite_blocked',
-                            'hint': u'如果确实要清空，请带 clear:true',
-                        })
+                if 'expected_revision' not in payload:
+                    self._send(428, {'error': 'expected_revision required', 'error_code': 'revision_required'})
+                    return
+                with STORAGE_LOCK:
+                    current = read_storage()
+                    if payload['expected_revision'] != current['revision']:
+                        self._send(409, {'error': 'storage changed', 'error_code': 'storage_conflict'})
                         return
-                stamp = put_storage(_data)
-                if stamp is None:
-                    self._send_error(500, 'could not save storage')
-                else:
-                    self._send(200, {'ok': True, 'updated': stamp})
+                    if _storage_is_empty(_data) and not payload.get('clear') and not _storage_is_empty(current['data']):
+                        self._send(409, {'error': 'refuse to overwrite non-empty storage with empty data',
+                                         'error_code': 'empty_overwrite_blocked'})
+                        return
+                    stamp = put_storage(_data)
+                    if stamp is None:
+                        self._send_error(500, 'could not save storage')
+                    else:
+                        self._send(200, {'ok': True, 'updated': stamp,
+                                         'revision': read_storage()['revision']})
                 return
             if re.search(r'/api/diary$', self.path):
                 if payload.get('action') == 'gen':

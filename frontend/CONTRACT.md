@@ -306,10 +306,11 @@ GET 还没回来（323KB 云端包 + 公网 RTT 很容易超过 1300ms），空�
 
 ### 存储整包（会话 + 日记 + 元信息）
 
-- `GET /api/storage` → `{data: <blob|null>, updated: <str|null>}`
-- `POST /api/storage {"data": <blob>}` → `{ok: true, updated: "<stamp>"}`
-  - 原子写（tmp + `os.replace`），落盘结构 `{v:1, updated, data}`
-  - **这是用户唯一的数据源**，任何测试都不能写它
+- `GET /api/storage` → `{data: <blob|null>, updated: <str|null>, revision: <str|null>}`
+- `POST /api/storage {"data": <blob>, "expected_revision": <str|null>}` → `{ok: true, updated: "<stamp>", revision: "<新版本>"}`
+  - 写入须携带读取到的版本；过期返回 409 `storage_conflict`，缺版本返回 428。
+  - 原子写（独立临时文件 + `os.replace`），清空须显式传 `clear: true`。
+  - 应使用隔离的临时数据目录测试，不得写入真实用户数据。
 
 ### 共同回忆
 
