@@ -1823,17 +1823,27 @@ def memory_snapshot(profile_id):
 STORAGE_LOCK = threading.RLock()
 
 
+class StorageReadError(Exception):
+    pass
+
+
 def read_storage():
-    """读取云端整包 → {'data': <blob|null>, 'updated': <str|null>}；无文件/损坏 → {data:None, updated:None}。"""
+    """Only an absent file represents empty storage; corrupt data fails closed."""
     try:
         with open(STORAGE_FILE, 'rb') as f:
             raw = f.read()
         blob = json.loads(raw.decode('utf-8'))
-        return {'data': blob.get('data'), 'updated': blob.get('updated'),
+        if not isinstance(blob, dict) or 'data' not in blob:
+            raise ValueError('storage envelope must contain data')
+        data = blob.get('data')
+        if data is not None and not valid_storage_data(data):
+            raise ValueError('invalid stored data shape')
+        return {'data': data, 'updated': blob.get('updated'),
                 'revision': hashlib.sha256(raw).hexdigest()}
     except FileNotFoundError:
         return {'data': None, 'updated': None, 'revision': None}
-
+    except Exception as e:
+        raise StorageReadError('saved conversation data are unreadable; restore from a backup') from e
 
 
 def valid_storage_data(data):
@@ -2261,15 +2271,28 @@ def _read_memory():
         return ''
 
 
+class SettingsReadError(Exception):
+    pass
+
+
 def _saved_settings():
-    """只读 settings.json（不含 .env 默认值），用于区分 Key 来源。"""
+    """Missing settings use defaults; unreadable settings must fail closed."""
     try:
         with SETTINGS_LOCK:
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
-        return saved if isinstance(saved, dict) else {}
-    except Exception:
+    except FileNotFoundError:
         return {}
+    except Exception as e:
+        raise SettingsReadError('saved model settings are unreadable') from e
+    if not isinstance(saved, dict):
+        raise SettingsReadError('saved model settings must be an object')
+    for field in ('base_url', 'model', 'reasoner_model', 'api_key'):
+        if field in saved and saved[field] is not None and not isinstance(saved[field], str):
+            raise SettingsReadError('invalid field in saved model settings')
+    if 'fallbacks' in saved and not isinstance(saved['fallbacks'], list):
+        raise SettingsReadError('invalid fallbacks in saved model settings')
+    return saved
 
 
 def model_settings():
@@ -2347,13 +2370,14 @@ def saved_fallbacks():
     return out
 
 
-def merge_fallbacks(raw_list):
+def merge_fallbacks(raw_list, old=None):
     """合并前端提交的备用模型列表。
 
     Key 不回显 → 前端没带 api_key 的条目沿用已存那把（先按 id，再按「地址+模型」匹配）；
     只有显式 clear_key=true 才清空。
     """
-    old = saved_fallbacks()
+    if old is None:
+        old = saved_fallbacks()
     by_id = dict((e['id'], e) for e in old)
     by_sig = dict(((e['base_url'], e['model']), e['api_key']) for e in old)
     out, seen = [], set()
@@ -2521,8 +2545,19 @@ def _save_model_settings_locked(data):
     """保存模型设置。api_key 语义：非空=替换；clear_key=true=清除；
     缺省或空串=保持原样（前端不会因为回显不了明文而误清 Key）。
     """
-    current = model_settings()
-    current['fallbacks'] = saved_fallbacks()
+    repairing = False
+    try:
+        current = model_settings()
+        current['fallbacks'] = saved_fallbacks()
+    except SettingsReadError:
+        if (not str(data.get('api_key') or '').strip() or data.get('clear_key')
+                or not re.match(r'^https?://', str(data.get('base_url') or ''))
+                or not str(data.get('model') or '').strip()):
+            raise ValueError('Unreadable settings require a complete service address, model and new API key')
+        repairing = True
+        current = {'base_url': str(data['base_url']).strip().rstrip('/'), 'model': data['model'],
+                   'reasoner_model': data.get('reasoner_model') or data['model'],
+                   'api_key': data['api_key'], 'timeout': 60, 'fallbacks': []}
     requested_base = str(data.get('base_url') or current['base_url']).strip().rstrip('/')
     if requested_base != current['base_url'] and not str(data.get('api_key') or '').strip():
         raise ValueError('A new API key is required when changing the model service address')
@@ -2534,7 +2569,7 @@ def _save_model_settings_locked(data):
     elif str(data.get('api_key') or '').strip():
         current['api_key'] = str(data['api_key']).strip()[:400]
     if 'fallbacks' in data:
-        current['fallbacks'] = merge_fallbacks(data.get('fallbacks'))
+        current['fallbacks'] = merge_fallbacks(data.get('fallbacks'), old=[] if repairing else None)
     current = model_settings_from(current)
     tmp = None
     try:
@@ -2547,6 +2582,11 @@ def _save_model_settings_locked(data):
             json_dump(current, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
+        if repairing:
+            backup_fd, backup = tempfile.mkstemp(prefix='.zqy-settings-corrupt-', suffix='.bak', dir=directory)
+            with os.fdopen(backup_fd, 'wb') as dest, open(SETTINGS_FILE, 'rb') as source:
+                import shutil
+                shutil.copyfileobj(source, dest)
         os.replace(tmp, SETTINGS_FILE)
         return public_settings()
     except Exception:
@@ -5927,10 +5967,23 @@ def archive_import(blob, force=False):
         zf.close()
         return out
     try:
-        for key, text, obj in entries:
+        for key, text, obj in sorted(entries, key=lambda entry: entry[0] != 'storage.json'):
             if key == 'storage.json':
                 with STORAGE_LOCK:
-                    if not force and read_storage().get('data'):
+                    try:
+                        current = read_storage()
+                    except StorageReadError:
+                        if not force:
+                            out['error_code'] = 'storage_unreadable'
+                            raise
+                        import tempfile
+                        import shutil
+                        directory = os.path.dirname(os.path.abspath(STORAGE_FILE))
+                        fd, backup = tempfile.mkstemp(prefix='.zqy-storage-corrupt-', suffix='.bak', dir=directory)
+                        with os.fdopen(fd, 'wb') as dest, open(STORAGE_FILE, 'rb') as source:
+                            shutil.copyfileobj(source, dest)
+                        current = {'data': None}
+                    if not force and current.get('data'):
                         out['storage'] = 'skipped_has_data'
                         continue
                     if put_storage(obj) is None:
@@ -5954,7 +6007,7 @@ def archive_import(blob, force=False):
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         out.update(ok=False, error='archive import failed: ' + str(e)[:160],
-                   error_code='archive_import_failed')
+                   error_code=out.get('error_code', 'archive_import_failed'))
     finally:
         zf.close()
     out['restored'] = (1 if out.get('storage') == 'restored' else 0) + \
@@ -6655,6 +6708,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 result = handle_chat(payload)
                 self._send(200, result)
+        except StorageReadError:
+            self._send(503, {'error': 'Saved conversation data are unreadable; restore from a backup',
+                             'error_code': 'storage_unreadable'})
         except (ValueError, KeyError) as e:
             # 客户端/校验错误 → 400
             self._send_error(400, str(e))
@@ -6693,10 +6749,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, memory_snapshot(pid))
             return
         if re.search(r'/api/settings$', path_only):
-            self._send(200, public_settings())
+            try:
+                self._send(200, public_settings())
+            except SettingsReadError:
+                self._send(503, {'error': 'Saved model settings are unreadable; enter the complete service address, model and key to repair them',
+                                 'error_code': 'settings_unreadable'})
             return
         if re.search(r'/api/storage$', path_only):
-            self._send(200, read_storage())
+            try:
+                self._send(200, read_storage())
+            except StorageReadError:
+                self._send(503, {'error': 'Saved conversation data are unreadable; restore from a backup',
+                                 'error_code': 'storage_unreadable'})
             return
         if re.search(r'/api/recall$', path_only):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -6953,8 +7017,11 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
-    if not model_settings().get('api_key'):
-        sys.stderr.write('WARNING: 模型密钥未配置，请通过设置页面填写\n')
+    try:
+        if not model_settings().get('api_key'):
+            sys.stderr.write('WARNING: 模型密钥未配置，请通过设置页面填写\n')
+    except SettingsReadError:
+        sys.stderr.write('WARNING: saved model settings unreadable; repair through the settings page\n')
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     sys.stderr.write('ZhiQingYu /api/chat backend listening on %s:%d\n'
                      % (LISTEN_HOST, LISTEN_PORT))

@@ -1,0 +1,8 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');const h=fs.readFileSync('frontend/index.html','utf8');
+const mStart=h.indexOf('    async function memBackupSnapshot('),mEnd=h.indexOf('    /* 导入：优先 memory_v2',mStart),eStart=h.indexOf("    const bkExport=document.getElementById('bkExport');"),eEnd=h.indexOf('    function mergeBackupData(',eStart);
+async function run(ok){let callback,finish,download,notices=[];const DB={sessions:[{id:'at-click'}],meta:{profileId:'at-click'}};
+const ctx={DB,document:{getElementById:()=>({addEventListener:(name,f)=>callback=f})},profileId:()=>DB.meta.profileId,snapshot:()=>DB,cloudPendingRecords:()=>({}),AbortController,setTimeout:()=>0,clearTimeout(){},keyOf:()=> 'date',dayShift:()=>0,dl:(name,text)=>download=JSON.parse(text),showToast:m=>notices.push(m),fetch:(url)=>{assert(url.includes('at-click'));return new Promise(r=>finish=r)}};
+vm.createContext(ctx);vm.runInContext(h.slice(mStart,mEnd)+h.slice(eStart,eEnd),ctx);const task=callback();DB.sessions=[{id:'after-click'}];DB.meta={profileId:'after-click'};
+finish({ok,json:async()=>ok?{items:['old profile fact'],items_v2:[]}:{error:'offline'}});await task;return {download,notices};}
+(async()=>{const complete=await run(true);assert.equal(complete.download.db.sessions[0].id,'at-click');assert.equal(complete.download.memory_status.profile_id,'at-click');assert(complete.download.memory_status.available);
+const partial=await run(false);assert.equal(partial.download.db.sessions[0].id,'at-click');assert(!partial.download.memory_status.available);assert(partial.notices.some(x=>x.includes('不含长期记忆')));console.log('JSON export preserves clicked profile snapshot and reports missing memories passed')})().catch(e=>{console.error(e);process.exitCode=1});

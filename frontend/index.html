@@ -2229,7 +2229,11 @@
   const cloudPendingKey=cloudPendingPrefix+cloudTabId;
   function cloudPendingRecords(){
     const out={};
-    try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&k.startsWith(cloudPendingPrefix))out[k]=JSON.parse(localStorage.getItem(k));}}catch(e){}
+    try{for(let i=0;i<localStorage.length;i++){
+      const k=localStorage.key(i);if(!k||!k.startsWith(cloudPendingPrefix))continue;
+      const raw=localStorage.getItem(k);if(raw===null)continue;
+      try{out[k]=JSON.parse(raw);}catch(e){out[k]={unreadable:true,raw:raw};}
+    }}catch(e){}
     return out;
   }
   function cloudUnsynced(){
@@ -4855,22 +4859,28 @@
     if(memRefresh) memRefresh.addEventListener('click',loadMem);
     window.zqyMemRefresh=loadMem;   /* 聊天里「撤销忘记」后同步设置里的列表 */
     /* 备份快照：items（旧格式）与 items_v2（新格式；旧后端给空数组） */
-    async function memBackupSnapshot(){
-      let items=[],items_v2=[];
+    async function memBackupSnapshot(targetProfile=profileId()){
+      const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),10000);
       try{
-        const d=await fetch('api/memory?profile_id='+encodeURIComponent(profileId())).then(function(r){ return r.json(); });
-        items=Array.isArray(d&&d.items)?d.items:[];
-        items_v2=Array.isArray(d&&d.items_v2)?d.items_v2:[];
-      }catch(e){}
-      return {items:items,items_v2:items_v2};
+        const response=await fetch('api/memory?profile_id='+encodeURIComponent(targetProfile),{signal:ctrl.signal});
+        const data=await response.json();
+        if(!response.ok||!data||!Array.isArray(data.items))throw new Error('memory unavailable');
+        return {available:true,profile_id:targetProfile,items:data.items,
+          items_v2:Array.isArray(data.items_v2)?data.items_v2:[]};
+      }catch(e){return {available:false,profile_id:targetProfile,items:[],items_v2:[]};}
+      finally{clearTimeout(timer);}
     }
     /* 导入：优先 memory_v2（对象数组，分类/重要度/置顶全保留），旧备份退回 memory（字符串数组） */
     async function memImport(backup,overwrite){
+      if(backup&&backup.memory_status&&backup.memory_status.available===false)return false;
       const v2=(Array.isArray(backup&&backup.memory_v2)?backup.memory_v2:[])
         .filter(function(o){ return o&&typeof o==='object'&&String(o.text||'').trim(); });
       const legacy=(Array.isArray(backup&&backup.memory)?backup.memory:[])
         .filter(function(s){ return typeof s==='string'&&s.trim(); });
-      if(!v2.length&&!legacy.length) return true;
+      if(!v2.length&&!legacy.length){
+        if(overwrite&&backup&&backup.memory_status&&backup.memory_status.available===true)return !!(await memPost({action:'replace',items:[]})).ok;
+        return true;
+      }
       return !!(await memPost({action:overwrite?'replace':'merge',items:v2.length?v2:legacy})).ok;
     }
 
@@ -5044,7 +5054,8 @@
     }
     async function loadModel(){
       try{
-        const s=await fetch('api/settings').then(r=>r.json());
+        const response=await fetch('api/settings'),s=await response.json();
+        if(!response.ok)throw new Error(s&&s.error||'模型设置读取失败');
         if(mdUrl.value!==(s.base_url||''))setModelChoices([]);
         mdUrl.value=s.base_url||'';
         mdModel.value=s.model||'';
@@ -5054,7 +5065,7 @@
         MD={hasKey:!!s.has_key,from:s.key_from||'server',tail:s.key_tail||'',host:mdHost(s.base_url)};
         mdEditing=false; mdClear=false; mdKey.value=''; mdKey.placeholder=MD_PH; mdKey.type='password'; mdKeyEye.innerHTML=MD_EYE;
         mdPaintKey(); mdMarkPreset(mdUrl.value); mdStatus('','未测试');
-      }catch(e){}
+      }catch(e){mdStatus('bad',String(e.message||'模型设置读取失败'));}
     }
     async function mdProbe(withChat){
       const body={base_url:mdUrl.value.trim(),model:mdModel.value.trim(),timeout:15};
@@ -5274,12 +5285,14 @@
     }
     const bkExport=document.getElementById('bkExport');
     if(bkExport) bkExport.addEventListener('click',async function(){
-      const snap=await memBackupSnapshot();   /* {items, items_v2}；旧后端 items_v2 为空数组 */
       try{
+        const targetProfile=profileId(),data=JSON.parse(JSON.stringify(snapshot())),pending=cloudPendingRecords();
+        const snap=await memBackupSnapshot(targetProfile);
         const stamp=keyOf(dayShift(0));
         dl('栀情屿-备份-'+stamp+'.json',
-          JSON.stringify({db:DB,memory:snap.items,memory_v2:snap.items_v2,pending_tabs:cloudPendingRecords()},null,2),'application/json');
-        showToast('已导出 JSON 备份');
+          JSON.stringify({db:data,memory:snap.items,memory_v2:snap.items_v2,pending_tabs:pending,
+            memory_status:{available:snap.available,profile_id:targetProfile}},null,2),'application/json');
+        showToast(snap.available?'已导出 JSON 备份':'已导出本机数据，但记忆读取失败；这份备份不含长期记忆');
       }catch(e){ showToast('导出失败，请重试'); }
     });
     function mergeBackupData(local,incoming,makeId){
@@ -5407,39 +5420,60 @@
     const arHint=document.getElementById('arHint');
     function arSay(hint,t){ if(hint){ hint.hidden=!t; hint.textContent=t||''; } }
     /* 真正的一次导入。force=false 时后端遇到已有对话只报 skipped_has_data，不乱覆盖。 */
+    let archiveImportBusy=false;
     async function arImportBytes(buf,force,hint){
+      if(archiveImportBusy||cloudBusy||cloudState==='pending'){showToast('正在同步或导入，请稍后重试');return;}
+      const previousState=cloudState;
+      archiveImportBusy=true;cloudBusy=true;cloudState='pending';
+      if(cloudT){clearTimeout(cloudT);cloudT=null;}
+      let restored=false,stateApplied=false;
       arSay(hint,'正在导入…');
-      let r=null,data=null;
       try{
-        r=await fetch('api/archive?action=import'+(force?'&force=1':'')+
-          '&profile_id='+encodeURIComponent(profileId()),
-          {method:'POST',headers:{'Content-Type':'application/zip'},body:buf});
-        try{ data=await r.json(); }catch(e){ data=null; }
-      }catch(e){ data=null; }
-      if(!data){ arSay(hint,''); showToast('网络不太好，导入没成功'); return; }
-      if(r&&r.status===413){ arSay(hint,''); showToast('这个包太大了，服务端上限 32MB'); return; }
-      if((r&&r.status===400)||data.ok!==true){
-        arSay(hint,'');
-        showToast(String(data.error||'这个包读不出来，可能不是有效的归档包'));
-        return;
+        if(window.zqyCancelChat)window.zqyCancelChat();
+        const importProfile=profileId(),generation=cloudGeneration;
+        let overwrite=force;
+        while(true){
+          const response=await fetch('api/archive?action=import'+(overwrite?'&force=1':'')+'&profile_id='+encodeURIComponent(importProfile),
+            {method:'POST',headers:{'Content-Type':'application/zip'},body:buf});
+          const data=await response.json();restored=!!(data&&data.storage==='restored');
+          if(!overwrite&&data&&data.error_code==='storage_unreadable'){
+            const repair=await zqyConfirm({title:'云端数据无法读取',body:'是否用这份归档修复？服务端会先保留损坏文件副本。',ok:'用归档修复',cancel:'保留原文件',danger:true});
+            if(repair){overwrite=true;continue;}
+          }
+          if(!response.ok||!data||data.ok!==true)throw new Error((data&&data.error)||'归档导入失败');
+          const memN=Array.isArray(data.memories)?data.memories.filter(x=>x.result==='restored').length:0;
+          const recN=Array.isArray(data.recall)?data.recall.filter(x=>x.result==='restored').length:0;
+          if(data.storage==='skipped_has_data'&&!overwrite){
+            const go=await zqyConfirm({title:'云端已经有对话数据了',
+              body:'覆盖后当前的对话和日记会被归档包里的替换掉。',ok:'覆盖导入',cancel:'只导入记忆',danger:true});
+            if(go){overwrite=true;continue;}
+            arSay(hint,'已导入记忆 '+memN+' 条、回忆 '+recN+' 段；对话没有覆盖');
+            showToast('导入好了');return;
+          }
+          if(restored){
+            const current=await fetch('api/storage',{cache:'no-store'});
+            const result=await current.json();
+            if(!current.ok||!result||!result.data||!Object.prototype.hasOwnProperty.call(result,'revision'))throw new Error('无法确认恢复后的云端数据');
+            if(cloudGeneration!==generation)throw new Error('恢复期间本机内容发生变化，请先导出备份再重新载入云端');
+            DB.sessions=Array.isArray(result.data.sessions)?result.data.sessions:[];
+            DB.diary=result.data.diary||{};DB.meta=result.data.meta||{};DB.activeId=result.data.activeId;
+            cloudRevision=result.revision;cloudSavedGeneration=generation;
+            setCloudUnsynced(false);normalizeDB();
+            profileId();if(!DB.sessions.length)newSession();if(!DB.activeId)DB.activeId=DB.sessions[0].id;
+            persistLocalSnapshot();cloudState='restored';stateApplied=true;
+            if(window.zqyRenderSession)window.zqyRenderSession();
+          }
+          arSay(hint,'已导入：对话 '+(restored?'已恢复':'未变')+'、记忆 '+memN+' 条、回忆 '+recN+' 段');
+          showToast('归档包已导入');return;
+        }
+      }catch(e){
+        cloudState='error';stateApplied=true;arSay(hint,'');
+        showToast((restored?'云端已有恢复数据，本机内容已保留：':'导入未完成，本机内容已保留：')+String(e.message||e));
+      }finally{
+        archiveImportBusy=false;cloudBusy=false;
+        if(!stateApplied)cloudState=previousState;
+        if(cloudState!=='error'&&cloudState!=='pending'&&cloudGeneration!==cloudSavedGeneration)cloudSync();
       }
-      const memN=Array.isArray(data.memories)?data.memories.filter(x=>x.result==='restored').length:0;
-      const recN=Array.isArray(data.recall)?data.recall.filter(x=>x.result==='restored').length:0;
-      if(data.storage==='skipped_has_data'&&!force){
-        /* 云端已经有对话了：如实问一句，绝不静默覆盖用户唯一的对话记录 */
-        const go=await zqyConfirm({title:'云端已经有对话数据了',
-          body:'导入默认不会覆盖它。要覆盖吗？覆盖后当前的对话和日记会被归档包里的替换掉。',
-          ok:'覆盖导入',cancel:'只导入记忆',danger:true});
-        if(go){ await arImportBytes(buf,true,hint); return; }
-        arSay(hint,'已导入记忆 '+memN+' 条、回忆 '+recN+' 段；对话没有覆盖');
-        showToast('导入好了');
-        return;
-      }
-      arSay(hint,'已导入：对话 '+(data.storage==='restored'?'已恢复':'未变')+
-        '、记忆 '+memN+' 条、回忆 '+recN+' 段');
-      showToast('归档包已导入');
-      /* 对话被替换过 → 重新读一次云端，别让页面继续显示旧内容 */
-      if(data.storage==='restored') setTimeout(function(){ location.reload(); },700);
     }
     const arImport=document.getElementById('arImport');
     if(arImport) arImport.addEventListener('click',function(){
@@ -7078,7 +7112,7 @@
         persistLocalSnapshot();
         cloudState='restored';   /* 云端内容已经装进 DB，之后写云端是安全的 */
         renderSession();
-      }catch(e){ cloudState='error'; }   /* 重试 3 次仍读不到 → 允许写（见文件头注释） */
+      }catch(e){cloudState='error';showToast('云端读取失败，已暂停同步；请勿清除本机数据，可先导出备份');}
     })();
   })();
   /* ==========================================================

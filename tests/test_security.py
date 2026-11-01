@@ -692,6 +692,64 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(server._archive_key('memories/../storage.json'), '')
         self.assertEqual(server._archive_key('memories/user.name.json'), '')
 
+    def test_corrupt_settings_never_send_a_request_to_default_provider(self):
+        from unittest.mock import patch
+        (DATA / 'settings.json').write_text('{broken json')
+        with patch.object(server.urllib.request, 'build_opener', side_effect=AssertionError('network request attempted')):
+            with self.assertRaises(server.SettingsReadError):
+                server._chat([], False)
+        status, _, body = self.request('GET', '/api/settings')
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)['error_code'], 'settings_unreadable')
+        self.assertEqual(self.request('GET', '/')[0], 200)
+        self.assertEqual(self.request('GET', '/health')[0], 200)
+
+    def test_corrupt_settings_require_explicit_complete_repair_and_keep_backup(self):
+        original = b'{broken settings with fake-old-key'
+        (DATA / 'settings.json').write_bytes(original)
+        with self.assertRaises(ValueError):
+            server.save_model_settings({'timeout': 40})
+        self.assertEqual((DATA / 'settings.json').read_bytes(), original)
+        result = server.save_model_settings({'base_url': 'https://repaired.example/v1', 'model': 'repaired-model',
+                                             'api_key': 'fake-repaired-key',
+                                             'fallbacks': [{'base_url': 'https://backup.example/v1', 'model': 'b', 'api_key': 'fake-backup'}]})
+        self.assertEqual(result['model'], 'repaired-model')
+        self.assertEqual(server.model_settings()['api_key'], 'fake-repaired-key')
+        self.assertEqual(len(server.saved_fallbacks()), 1)
+        self.assertTrue(any(p.read_bytes() == original for p in DATA.glob('.zqy-settings-corrupt-*.bak')))
+
+    def test_invalid_settings_shapes_fail_closed(self):
+        for value in ([], {'base_url': 42}, {'api_key': ['wrong']}, {'fallbacks': {}}):
+            (DATA / 'settings.json').write_text(json.dumps(value))
+            with self.assertRaises(server.SettingsReadError):
+                server.model_settings()
+
+    def test_corrupt_storage_is_not_reported_as_empty_or_silently_replaced(self):
+        for raw in (b'{broken', b'[]', b'{"data":[]}', b'{}'):
+            (DATA / 'storage.json').write_bytes(raw)
+            status, _, body = self.request('GET', '/api/storage')
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)['error_code'], 'storage_unreadable')
+            self.assertNotIn('revision', json.loads(body))
+            payload = json.dumps({'data': {'sessions': []}, 'expected_revision': None}).encode()
+            self.assertEqual(self.request('POST', '/api/storage', payload, {'Content-Type': 'application/json'})[0], 503)
+            self.assertEqual((DATA / 'storage.json').read_bytes(), raw)
+
+    def test_explicit_archive_restore_can_repair_corrupt_storage(self):
+        import io
+        import zipfile
+        (DATA / 'storage.json').write_bytes(b'{broken')
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('storage.json', json.dumps({'sessions': [{'msgs': ['recovered']}]}))
+        refused = server.archive_import(archive.getvalue(), False)
+        self.assertFalse(refused['ok'])
+        self.assertEqual(refused['error_code'], 'storage_unreadable')
+        self.assertEqual((DATA / 'storage.json').read_bytes(), b'{broken')
+        self.assertTrue(server.archive_import(archive.getvalue(), True)['ok'])
+        self.assertEqual(server.read_storage()['data']['sessions'][0]['msgs'], ['recovered'])
+        self.assertTrue(any(p.read_bytes() == b'{broken' for p in DATA.glob('.zqy-storage-corrupt-*.bak')))
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)
