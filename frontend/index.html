@@ -2300,10 +2300,10 @@
      原则：宁可丢一条消息的元信息，也不能让整页渲染挂掉。 */
   function normalizeDB(){
     if(!DB.sessions||!Array.isArray(DB.sessions)) DB.sessions=[];
-    DB.sessions=DB.sessions.filter(s=>s&&typeof s==='object');
+    DB.sessions=DB.sessions.filter(s=>s&&typeof s==='object'&&!Array.isArray(s));
     DB.sessions.forEach(s=>{
       if(!Array.isArray(s.msgs)) s.msgs=[];
-      s.msgs=s.msgs.filter(m=>m&&typeof m==='object'&&m.id);
+      s.msgs=s.msgs.filter(m=>m&&typeof m==='object'&&!Array.isArray(m)&&m.id);
       s.msgs.forEach(m=>{
         if(m.role!=='ai'&&m.role!=='me') m.role='me';
         if(typeof m.text!=='string') m.text='';
@@ -2342,8 +2342,8 @@
       if(typeof s.id!=='string'||!s.id) s.id='s_'+Math.random().toString(36).slice(2,10);
     });
     /* 会话 id 去重：activeId 定位依赖唯一 id，重复 id 会让 find 命中错会话 */
-    (function(){ const seen={};
-      DB.sessions=DB.sessions.filter(s=>{ if(seen[s.id]) return false; seen[s.id]=1; return true; });
+    (function(){const seen=new Set();
+      DB.sessions=DB.sessions.filter(s=>{if(seen.has(s.id))return false;seen.add(s.id);return true;});
     })();
     if(!DB.diary||typeof DB.diary!=='object') DB.diary={};
     Object.keys(DB.diary).forEach(k=>{
@@ -5260,7 +5260,8 @@
       }catch(e){ showToast('导出失败，请重试'); }
     });
     function mergeBackupData(local,incoming,makeId){
-      const clone=v=>JSON.parse(JSON.stringify(v));
+      const clone=v=>JSON.parse(JSON.stringify(v),(key,value)=>['__proto__','constructor','prototype'].includes(key)?undefined:value);
+      local=clone(local);incoming=clone(incoming);
       const sessions=clone(local.sessions||[]);
       function orderMessages(existing,imported){
         const nodes=new Map(),rank=new Map(),edges=new Map(),degree=new Map();
@@ -5313,6 +5314,7 @@
       const diary=clone(local.diary||{});
       const mergeText=(a,b)=>!a?b:(!b||a===b||a.includes('【备份版本】\n'+b)?a:a+'\n\n【备份版本】\n'+b);
       for(const [day,source] of Object.entries(incoming.diary||{})){
+        if(!/^\d{4}-\d{2}-\d{2}$/.test(day)||!source||typeof source!=='object'||Array.isArray(source))continue;
         if(!diary[day]){diary[day]=clone(source);continue;}
         const target=diary[day];
         for(const field of ['manual','narrative'])target[field]=mergeText(String(target[field]||''),String(source[field]||''));
@@ -5345,10 +5347,11 @@
         const reader=new FileReader();
         reader.onload=async function(){
           try{
-            const backup=JSON.parse(reader.result), selected=selectBackupData(backup,window.prompt.bind(window));
+            const backup=JSON.parse(reader.result,(key,value)=>['__proto__','constructor','prototype'].includes(key)?undefined:value), selected=selectBackupData(backup,window.prompt.bind(window));
             if(!selected)return;
             const data=selected.data;
-            if(!Array.isArray(data.sessions)||!data.diary||typeof data.diary!=='object') throw new Error('format');
+            if(!data||!Array.isArray(data.sessions)||!data.diary||typeof data.diary!=='object'||Array.isArray(data.diary)
+              ||(data.meta!==undefined&&(!data.meta||typeof data.meta!=='object'||Array.isArray(data.meta))))throw new Error('format');
             const overwrite=await zqyConfirm({title:'确定覆盖本机对话、日记和设置吗？',body:'取消则合并：保留双方消息，不应用删除；消息内容冲突时另存备份会话副本。',ok:'覆盖导入',cancel:'合并导入'});
             if(window.zqyCancelChat)window.zqyCancelChat();
             if(overwrite){ DB.sessions=data.sessions; DB.diary=data.diary; DB.meta=data.meta||{}; DB.activeId=data.activeId; }

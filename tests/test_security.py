@@ -390,6 +390,26 @@ class SecurityTests(unittest.TestCase):
                 status, _, _ = self.request('POST', path, payload.encode(), {'Content-Type': 'application/json'})
                 self.assertEqual(status, 400)
 
+    def test_invalid_storage_shapes_do_not_replace_saved_data(self):
+        revision = server.read_storage()['revision']
+        for data in (None, [], 'invalid', {'sessions': {}}, {'diary': []}, {'meta': []}):
+            payload = json.dumps({'expected_revision': revision, 'data': data}).encode()
+            status, _, _ = self.request('POST', '/api/storage', payload, {'Content-Type': 'application/json'})
+            self.assertEqual(status, 400)
+            self.assertEqual(server.read_storage()['revision'], revision)
+
+    def test_invalid_archive_storage_is_reported_without_overwriting(self):
+        import io
+        import zipfile
+        revision = server.read_storage()['revision']
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as archive:
+            archive.writestr('storage.json', json.dumps({'sessions': 42}))
+        result = server.archive_import(data.getvalue(), True)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error_code'], 'archive_invalid_storage')
+        self.assertEqual(server.read_storage()['revision'], revision)
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

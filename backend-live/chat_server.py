@@ -1816,6 +1816,15 @@ def read_storage():
 
 
 
+def valid_storage_data(data):
+    if not isinstance(data, dict):
+        return False
+    for key, kind in (('sessions', list), ('diary', dict), ('meta', dict)):
+        if key in data and not isinstance(data[key], kind):
+            return False
+    return True
+
+
 def _storage_is_empty(data):
     u"""整包 data 是否「一点用户内容都没有」。用于挡住「空库覆盖真数据」。"""
     if not isinstance(data, dict):
@@ -5813,8 +5822,11 @@ def archive_import(blob, force=False):
                 continue
             if key == 'storage.json':
                 obj = extract_json_obj(text)
-                if obj is None:
-                    out['skipped'].append('storage.json（不是合法 JSON）')
+                if not valid_storage_data(obj):
+                    out['ok'] = False
+                    out['error'] = 'invalid storage data in archive'
+                    out['error_code'] = 'archive_invalid_storage'
+                    out['skipped'].append('storage.json（数据结构无效）')
                     continue
                 with STORAGE_LOCK:
                     if not force and read_storage().get('data'):
@@ -6506,6 +6518,9 @@ class Handler(BaseHTTPRequestHandler):
                 _data = payload.get('data')
                 if 'expected_revision' not in payload:
                     self._send(428, {'error': 'expected_revision required', 'error_code': 'revision_required'})
+                    return
+                if not valid_storage_data(_data):
+                    self._send_error(400, 'invalid storage data')
                     return
                 with STORAGE_LOCK:
                     current = read_storage()
