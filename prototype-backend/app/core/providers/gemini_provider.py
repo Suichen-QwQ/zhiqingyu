@@ -13,7 +13,7 @@ class GeminiProvider(JsonChatLLMProvider):
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
         super().__init__()
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self.api_key = os.getenv("GEMINI_API_KEY") if api_key is None else api_key
         self.base_url = base_url or os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
         self.model = model or os.getenv("GEMINI_MODEL", "gemini-pro")
 
@@ -42,7 +42,7 @@ class GeminiProvider(JsonChatLLMProvider):
                     })
 
             url = f"{self.base_url}/models/{self.model}:generateContent"
-            params = {"key": self.api_key}
+            headers = {"x-goog-api-key": self.api_key}
             
             payload = {
                 "contents": contents,
@@ -57,7 +57,7 @@ class GeminiProvider(JsonChatLLMProvider):
             }
 
             with httpx.Client(timeout=60.0) as client:
-                response = client.post(url, params=params, json=payload)
+                response = client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
                 
                 result_data = response.json()
@@ -70,7 +70,7 @@ class GeminiProvider(JsonChatLLMProvider):
                             result_text = parts[0]["text"]
                             return result_text
                 
-                raise ValueError(f"Unexpected Gemini API response format: {result_data}")
+                raise ValueError("Unexpected Gemini API response format")
         except Exception as e:
             self.logger.error(f"[Gemini Provider] 文本生成失败: {str(e)}", exc_info=True)
             raise
@@ -98,7 +98,7 @@ class GeminiProvider(JsonChatLLMProvider):
                 })
 
         url = f"{self.base_url}/models/{self.model}:generateContent"
-        params = {"key": self.api_key}
+        headers = {"x-goog-api-key": self.api_key}
         
         payload = {
             "contents": contents,
@@ -114,7 +114,7 @@ class GeminiProvider(JsonChatLLMProvider):
         }
 
         with httpx.Client(timeout=60.0) as client:
-            response = client.post(url, params=params, json=payload)
+            response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             
             result_data = response.json()
@@ -125,8 +125,8 @@ class GeminiProvider(JsonChatLLMProvider):
                     parts = candidate["content"]["parts"]
                     if parts and "text" in parts[0]:
                         result_text = parts[0]["text"]
-                        self.logger.info(f"[Gemini Provider] API响应: {result_text}")
+
                         return result_text
             
-            raise ValueError(f"Unexpected Gemini API response format: {result_data}")
+            raise ValueError("Unexpected Gemini API response format")
 

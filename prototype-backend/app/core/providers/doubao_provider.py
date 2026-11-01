@@ -3,6 +3,7 @@
 """
 import os
 from openai import OpenAI
+import httpx
 
 from app.core.providers.base_provider import JsonChatLLMProvider
 
@@ -12,14 +13,15 @@ class DoubaoProvider(JsonChatLLMProvider):
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
         super().__init__()
-        self.api_key = api_key or os.getenv("DOUBAO_API_KEY")
+        self.api_key = os.getenv("DOUBAO_API_KEY") if api_key is None else api_key
         self.base_url = base_url or os.getenv("DOUBAO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
         self.model = model or os.getenv("DOUBAO_MODEL", "ep-20241201220000-xxxxx")
 
         if not self.api_key:
             raise ValueError("API key is required for Doubao provider")
 
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url,
+                             http_client=httpx.Client(timeout=60.0, follow_redirects=False), max_retries=1)
 
     def _perform_text_completion(self, chat_messages) -> str | dict:
         """
@@ -71,6 +73,6 @@ class DoubaoProvider(JsonChatLLMProvider):
         )
 
         result_text = response.choices[0].message.content
-        self.logger.info(f"[Doubao Provider] API响应: {result_text}")
+
         return result_text
 

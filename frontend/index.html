@@ -2168,6 +2168,7 @@
   const sesUid=()=>'s_'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
   function allMsgs(){ const r=[]; DB.sessions.forEach(s=>{ if(s.msgs) r.push.apply(r,s.msgs); }); return r; }
     function newSession(title){
+      if(window.zqyCancelVoice)window.zqyCancelVoice();
       if(window.zqyCancelChat)window.zqyCancelChat();
       if(window.zqyTts) window.zqyTts.stop();   /* 开新对话：先停下正在朗读的语音 */
       const id=sesUid();
@@ -2185,11 +2186,13 @@
     return f?f.text.slice(0,14):('对话 '+(DB.sessions.indexOf(s)+1));
   }
   function setActive(id){
+      if(window.zqyCancelVoice)window.zqyCancelVoice();
     if(id!==DB.activeId&&window.zqyCancelChat)window.zqyCancelChat();
     if(window.zqyTts) window.zqyTts.stop();   /* 切历史会话：不接着念上一条会话的语音 */
     DB.activeId=id; dbSave();
   }
   function removeSession(id){
+      if(window.zqyCancelVoice)window.zqyCancelVoice();
     if(window.zqyCancelChat)window.zqyCancelChat(id);
     if(window.zqyTts) window.zqyTts.stop();   /* 删会话：先停下这条会话的语音 */
     const i=DB.sessions.findIndex(s=>s.id===id);
@@ -5020,7 +5023,7 @@
     const MD_EYE_OFF='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M3 3l18 18"/><path d="M10.6 6.1A9.9 9.9 0 0 1 12 6c6.4 0 10 6 10 6a17 17 0 0 1-3.2 3.9M6.3 8.2A16.6 16.6 0 0 0 2 12s3.6 6 10 6a9.6 9.6 0 0 0 3.6-.7"/></svg>';
     const MD_PH='sk-...（留空不改动）';
     const MD_HINT_DEF='Key 只写进服务器端 settings.json（权限 600），页面只显示后 4 位，不回传明文。';
-    const MD_HINT_WARN='地址已改，原来的 Key 可能不适用这个网关。建议点「更换」重填，否则保存后仍沿用旧 Key。';
+    const MD_HINT_WARN='地址已改，请点「更换」填写对应服务的新 Key，再保存。';
     let MD={hasKey:false,from:'server',tail:'',host:''}, mdEditing=false, mdClear=false;
     function mdHost(u){ const m=/^https?:\/\/([^\/:]+)/.exec(String(u||'').trim()); return m?m[1].toLowerCase():''; }
     function mdStatus(kind,text){
@@ -5054,13 +5057,17 @@
       if(MD.hasKey){
         txt.textContent='已保存 sk-••••••••'+(MD.tail||'')+(MD.from==='server'?'（服务器默认）':'');
       }else{
-        txt.textContent='未设置 Key，使用服务器默认';
+        txt.textContent='未设置 Key，请填写当前服务的密钥';
       }
       mdHint();
     }
+    let modelLoadSeq=0,modelSaving=false;
+    function modelFormState(){return JSON.stringify([mdUrl.value,mdModel.value,mdReason.value,mdTimeout.value,mdKey.value,mdEditing,mdClear,fbCollect()]);}
     async function loadModel(){
+      const seq=++modelLoadSeq,form=modelFormState();
       try{
         const response=await fetch('api/settings'),s=await response.json();
+        if(seq!==modelLoadSeq||form!==modelFormState()||modelSaving)return;
         if(!response.ok)throw new Error(s&&s.error||'模型设置读取失败');
         if(mdUrl.value!==(s.base_url||''))setModelChoices([]);
         mdUrl.value=s.base_url||'';
@@ -5071,7 +5078,7 @@
         MD={hasKey:!!s.has_key,from:s.key_from||'server',tail:s.key_tail||'',host:mdHost(s.base_url)};
         mdEditing=false; mdClear=false; mdKey.value=''; mdKey.placeholder=MD_PH; mdKey.type='password'; mdKeyEye.innerHTML=MD_EYE;
         mdPaintKey(); mdMarkPreset(mdUrl.value); mdStatus('','未测试');
-      }catch(e){mdStatus('bad',String(e.message||'模型设置读取失败'));}
+      }catch(e){if(seq===modelLoadSeq&&form===modelFormState())mdStatus('bad',String(e.message||'模型设置读取失败'));}
     }
     async function mdProbe(withChat){
       const body={base_url:mdUrl.value.trim(),model:mdModel.value.trim(),timeout:15};
@@ -5096,7 +5103,7 @@
       setModelChoices([]);mdEditing=true; mdClear=true; mdKey.value='';
       mdKey.placeholder='留空保存 = 清除 Key';
       mdPaintKey(); mdKey.focus();
-      showToast('保存后将清除 Key，回落到服务器默认');
+      showToast('保存后将清除当前保存的 Key');
     });
     mdKeyEye.addEventListener('click',function(){
       const open=mdKey.type==='password';
@@ -5128,23 +5135,25 @@
       finally{b.disabled=false;b.querySelector('svg').classList.remove('md-spin');}
     });
     document.getElementById('mdTest').addEventListener('click',async function(){
-      const b=this;
+      const b=this,form=modelFormState();
       if(!/^https?:\/\//.test(mdUrl.value.trim())){ mdStatus('bad','地址要以 http(s):// 开头'); return; }
       b.disabled=true; b.querySelector('svg').classList.add('md-spin');
       mdStatus('run','正在试连…');
       try{
         const r=await mdProbe(true);
+        if(form!==modelFormState())return;
         if(r&&r.ok){
           const ms=r.chat_ok?r.chat_latency_ms:r.latency_ms;
           mdStatus('ok','连接成功 · '+(ms||'?')+'ms'+(r.chat_ok?' · 对话接口可用':' · /models 可用'));
         }else{
           mdStatus('bad',(r&&r.error)||'连接失败');
         }
-      }catch(e){ mdStatus('bad','请求后端失败'); }
-      b.disabled=false; b.querySelector('svg').classList.remove('md-spin');
+      }catch(e){if(form===modelFormState())mdStatus('bad','请求后端失败');}
+      finally{b.disabled=false;b.querySelector('svg').classList.remove('md-spin');}
     });
     const mdSave=document.getElementById('mdSave');
     if(mdSave) mdSave.addEventListener('click',async function(){
+      if(modelSaving)return;
       const url=mdUrl.value.trim();
       if(!/^https?:\/\//.test(url)){ showToast('模型服务地址要填完整 http(s)://'); return; }
       const to=Math.min(120,Math.max(10,Number(mdTimeout.value)||60));
@@ -5160,16 +5169,21 @@
         if(mdKey.value.trim()) body.api_key=mdKey.value.trim();
         else if(mdClear) body.clear_key=true;
       }
+      const form=modelFormState();modelSaving=true;mdSave.disabled=true;modelLoadSeq++;
       try{
-        const out=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(body)}).then(r=>r.json());
+        const response=await fetch('api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(body)});
+        const out=await response.json();
+        if(!response.ok)throw new Error(out&&out.error||'模型设置保存失败');
+        if(form!==modelFormState()){showToast('模型设置已保存，新输入的内容已保留');return;}
         if(out&&out.model!==undefined){
           MD={hasKey:!!out.has_key,from:out.key_from||'server',tail:out.key_tail||'',host:mdHost(out.base_url)};
           mdEditing=false; mdClear=false; mdKey.value=''; mdKey.placeholder=MD_PH;
           mdPaintKey(); mdStatus('','未测试'); fbRender(out.fallbacks||[]);
           showToast('模型设置已保存');
         }else{ showToast((out&&out.error)||'模型设置保存失败'); }
-      }catch(e){ showToast('暂时无法保存模型设置'); }
+      }catch(e){showToast(String(e.message||'暂时无法保存模型设置'));}
+      finally{modelSaving=false;mdSave.disabled=false;}
     });
     /* ---- 备用模型：首选失败时按顺序自动顺延 ---- */
     const mdFbList=document.getElementById('mdFbList');
@@ -5532,6 +5546,7 @@
     let rec=null,az=null,pressing=false,cancelled=false,startY=0;
     let azRetry=false;         /* NotReadableError（麦克风被占用）已自动重试过一次 */
     let recMode=null;          /* 本次按住正在用的链路: 'sr' | 'az' */
+    let voiceEpoch=0,voiceTarget=null,transcription=null;
     let srCb=false,srWatch=null,srEnded=false;   /* SR回调标记 / 挂起看门狗 / 本次松手已处理 */
     let srBroken=false;        /* 本环境 SR 不可用（谷歌语音被墙/ROM 无语音服务）→ 改走后端 Azure */
     let micDenied=false;       /* 本次按住发现拿不到麦克风（权限被拒/设备占用）→ 弹层里写明原因 */
@@ -5566,7 +5581,7 @@
       if(m==='voice'){ micWarm(); }
     }
     function fmtTime(ms){const s=Math.floor(ms/1000);return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
-    function startTimer(){timerStart=Date.now();vlTime.textContent='00:00';timerInt=setInterval(()=>{vlTime.textContent=fmtTime(Date.now()-timerStart)},200)}
+    function startTimer(){timerStart=Date.now();vlTime.textContent='00:00';timerInt=setInterval(()=>{vlTime.textContent=fmtTime(Date.now()-timerStart);if(pressing&&Date.now()-timerStart>=60000)pressEnd();},200)}
     function stopTimer(){if(timerInt){clearInterval(timerInt);timerInt=null}}
     const vlActions=document.getElementById('vlActions');
     function positionLayer(){
@@ -5607,11 +5622,13 @@
       startAzure();
     }
     function startSR(){
+      const epoch=voiceEpoch;
       finalText=''; interimText='';
       recMode='sr';
       rec=new SR();
       rec.lang='zh-CN'; rec.continuous=true; rec.interimResults=true;
       rec.onresult=function(e){
+        if(epoch!==voiceEpoch)return;
         srCb=true; if(srWatch){ clearTimeout(srWatch); srWatch=null; }
         interimText='';
         for(let i=e.resultIndex;i<e.results.length;i++){
@@ -5620,6 +5637,7 @@
         }
       };
       rec.onerror=function(e){
+        if(epoch!==voiceEpoch)return;
         srCb=true; if(srWatch){ clearTimeout(srWatch); srWatch=null; }
         if(e.error==='network'||e.error==='service-not-allowed'){
           /* 本机识别服务不通（国产浏览器/无GMS ROM 常见）→ 降级后端 Azure；并行采音已在录，接着用 */
@@ -5657,6 +5675,7 @@
         else if(e.error!=='aborted'&&e.error!=='no-speech') showToast('语音识别出了点问题');
       };
       rec.onend=function(){
+        if(epoch!==voiceEpoch)return;
         srCb=true; if(srWatch){ clearTimeout(srWatch); srWatch=null; }
         srSendOrFallback();
       };
@@ -5665,7 +5684,7 @@
          4 秒仍无任何回调 → 判死并当场切录音链路，正在说的后半段还能录到 */
       srWatch=setTimeout(function(){
         srWatch=null;
-        if(srCb||!pressing) return;
+        if(epoch!==voiceEpoch||srCb||!pressing) return;
         markSRBroken(); recMode='az';
         try{ rec&&rec.abort(); }catch(e){}
       },4000);
@@ -5693,7 +5712,8 @@
       }
     }
     function startAzure(){
-      finalText=''; interimText=''; azRetry=false;
+      const epoch=voiceEpoch;let pendingStream=null,pendingContext=null;
+      finalText=''; interimText='';
       if(!window.isSecureContext){
         /* 非安全上下文：浏览器禁用麦克风，夸克等还会误报 NotAllowedError */
         voiceIssue('暂时无法使用麦克风','请通过 HTTPS 安全连接打开此页面，再试一次。也可以先用文字聊聊。');
@@ -5701,8 +5721,10 @@
       }
       if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ voiceIssue('当前浏览器不支持录音','可以换个浏览器试试，或先用文字聊聊。'); return; }
       navigator.mediaDevices.getUserMedia({audio:{channelCount:1}}).then(function(stream){
+        if(epoch!==voiceEpoch||!pressing){stream.getTracks().forEach(function(t){t.stop();});return;}
+        pendingStream=stream;
         const Ctx=window.AudioContext||window.webkitAudioContext;
-        const ctx=new Ctx();
+        const ctx=new Ctx();pendingContext=ctx;
         const src=ctx.createMediaStreamSource(stream);
         const node=ctx.createScriptProcessor(4096,1,1);
         const chunks=[];
@@ -5714,12 +5736,16 @@
         };
         src.connect(node); node.connect(ctx.destination);
         az={ctx:ctx,stream:stream,node:node,src:src,chunks:chunks,rate:ctx.sampleRate};
+        pendingStream=null;pendingContext=null;
         if(recMode==='sr'&&useSR&&!srBroken&&!rec){ startSR(); }   /* 麦克风到手后再启 SR，不再同时抢设备 */
       }).catch(function(err){
+        if(pendingStream)pendingStream.getTracks().forEach(function(t){t.stop();});
+        if(pendingContext){try{pendingContext.close();}catch(e){}}
+        if(epoch!==voiceEpoch)return;
         if(err&&err.name==='NotReadableError'&&pressing&&!azRetry){
           /* 麦克风被占用（其他App/浏览器残留媒体进程）→ 放一拍立即用最简约束重试一次 */
           azRetry=true;
-          setTimeout(function(){ if(!pressing||az) return; az=null; startAzure(); },350);
+          setTimeout(function(){ if(epoch!==voiceEpoch||!pressing||az) return; az=null; startAzure(); },350);
           return;
         }
         if(err&&err.name==='NotReadableError'){
@@ -5767,23 +5793,33 @@
       return new Blob([b],{type:'audio/wav'});
     }
     function endAzure(){
+      const epoch=voiceEpoch,target=voiceTarget;
       stopAzure().then(function(r){
+        if(epoch!==voiceEpoch)return;
         if(release==='cancel'){ release=null; return; }
         if(!r||!r.blob){ release=null; return; }
         vlLabel.textContent='识别中…'; vlHint.textContent='正在把语音转成文字';
-        fetch('api/transcribe?lang=zh-CN&rate='+encodeURIComponent(r.rate),{method:'POST',body:r.blob})
+        const ac=new AbortController();transcription=ac;const timer=setTimeout(()=>ac.abort(),30000);
+        fetch('api/transcribe?lang=zh-CN&rate='+encodeURIComponent(r.rate),{method:'POST',body:r.blob,signal:ac.signal})
           .then(function(x){ return x.ok?x.json():Promise.reject(); })
-          .then(function(d){ release=null; const t=(d.text||'').trim(); if(!t){ showToast('没听清，再按住说一次'); return; } commitSend(t); })
-          .catch(function(){ release=null; showToast('语音识别失败，稍后再试'); });
+          .then(function(d){ if(epoch!==voiceEpoch)return; release=null; const t=(d.text||'').trim(); if(!t){ showToast('没听清，再按住说一次'); return; } commitSend(t,target); })
+          .catch(function(){ if(epoch!==voiceEpoch)return;release=null;showToast('语音识别失败，稍后再试'); })
+          .finally(function(){clearTimeout(timer);if(transcription===ac)transcription=null;});
       });
     }
-    function commitSend(text){
+    function commitSend(text,target=voiceTarget){
+      if(!target||target.epoch!==voiceEpoch||!DB.sessions.includes(target.session)||curSess()!==target.session
+          ||DB.diary!==target.diary||ta.value!==target.input){showToast('会话或输入已变化，语音未发送');return;}
       ta.value=text;
       ta.dispatchEvent(new Event('input',{bubbles:true}));
       sendMsg();   /* 松手即发送；sendMsg 自带空值与长度保护 */
     }
     function pressStart(y){
-      pressing=true; cancelled=false; startY=y; srEnded=false; srCb=false; micDenied=false;
+      if(pressing)return;
+      voiceEpoch++;if(transcription){transcription.abort();transcription=null;}
+      if(az)stopAzure();try{rec&&rec.abort();}catch(e){}rec=null;
+      voiceTarget={epoch:voiceEpoch,session:curSess(),diary:DB.diary,input:ta.value};
+      pressing=true; cancelled=false; startY=y; srEnded=false; srCb=false; micDenied=false;azRetry=false;
       if(srWatch){ clearTimeout(srWatch); srWatch=null; }
       hold.classList.add('press');
       layer.classList.remove('cancel');
@@ -5820,7 +5856,7 @@
       closeLayer();
       if(recMode==='sr'){
         kill();   /* 只停 SR；并行录音保留，SR 没出字时松手后交给 Azure */
-        setTimeout(srSendOrFallback,1600);   /* SR 挂起不回调时，1.6s 后兜底裁决 */
+        const epoch=voiceEpoch;setTimeout(function(){if(epoch===voiceEpoch)srSendOrFallback();},1600);   /* SR 挂起不回调时，1.6s 后兜底裁决 */
       } else { endAzure(); }
     }
     hold.addEventListener('mousedown',function(e){ e.preventDefault(); pressStart(e.clientY); });
@@ -5831,11 +5867,16 @@
     document.addEventListener('touchend',pressEnd);
     hold.addEventListener('contextmenu',function(e){ e.preventDefault(); });
     btn.addEventListener('click',function(){ setMode(mode==='text'?'voice':'text'); });
-    document.addEventListener('visibilitychange',function(){
-      if(!document.hidden) return;
-      if(pressing){ pressing=false; release='cancel'; closeLayer(); kill(); }   /* 切后台视为取消，不误发 */
-    });
-    window.addEventListener('pagehide',function(){ if(az){ release='cancel'; stopAzure(); } });   /* 页面离开必须还麦克风 */
+    function cancelVoice(){
+      voiceEpoch++;voiceTarget=null;pressing=false;release='cancel';
+      if(transcription){transcription.abort();transcription=null;}
+      if(srWatch){clearTimeout(srWatch);srWatch=null;}
+      try{rec&&rec.abort();}catch(e){}rec=null;
+      stopAzure();hold.classList.remove('press');closeLayer();
+    }
+    window.zqyCancelVoice=cancelVoice;
+    document.addEventListener('visibilitychange',function(){if(document.hidden)cancelVoice();});
+    window.addEventListener('pagehide',cancelVoice);
   })();
   /* 横幅是 sticky，会占掉一段视口高度；把它的「自然高度」回写成 --off-h，
      让 #v-chat 的 calc() 自己减掉，避免吸底输入条被顶出屏幕。

@@ -1,13 +1,13 @@
 # 构建阶段
-FROM node:18-alpine AS builder
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 
 # 安装 pnpm
-RUN npm install -g pnpm
+RUN npm install -g pnpm@11.25.0
 
 # 复制package文件
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
 # 安装依赖
 RUN pnpm install --frozen-lockfile

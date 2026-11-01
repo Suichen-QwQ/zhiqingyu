@@ -102,7 +102,7 @@ async def get_stats_overview(
     except Exception as e:
         error_detail = ErrorDetail(
             code="STATS_ERROR",
-            message=f"获取统计信息时发生错误: {str(e)}"
+            message="获取统计信息时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -180,6 +180,6 @@ async def get_tokens_stats(
     except Exception as e:
         error_detail = ErrorDetail(
             code="TOKENS_STATS_ERROR",
-            message=f"获取Tokens统计信息时发生错误: {str(e)}"
+            message="获取Tokens统计信息时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)

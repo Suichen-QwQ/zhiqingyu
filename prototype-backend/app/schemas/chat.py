@@ -1,9 +1,15 @@
 """
 聊天相关的Pydantic模型
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Literal, Optional
 from datetime import datetime
+
+
+class PromptMessage(BaseModel):
+    """Internal prompt message; system prompts never enter the public chat schema."""
+    role: Literal["system", "user", "assistant"]
+    content: str
 
 
 class ChatMessage(BaseModel):
@@ -16,7 +22,15 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """聊天请求"""
     session_id: Optional[str] = None
-    messages: list[ChatMessage]
+    messages: list[ChatMessage] = Field(min_length=1, max_length=200)
+
+    @field_validator("messages")
+    @classmethod
+    def require_user_turn(cls, messages):
+        if messages[-1].role != "user" or not messages[-1].content.strip():
+            raise ValueError("The latest message must be a nonempty user message")
+        return messages
+
     experience_mode: Optional[Literal["A", "B", "C", "D"]] = None  # 体验模式：A:只想被听 B:想搞懂 C:想要建议 D:系统深聊
     ai_style: Optional[str] = None  # AI风格：comfort, analyst, coach, mentor, friend, listener, growth, crisis_safe
     chat_mode: Optional[Literal["deep", "quick"]] = None  # 聊天模式：deep(深聊模式) 或 quick(快速模式)

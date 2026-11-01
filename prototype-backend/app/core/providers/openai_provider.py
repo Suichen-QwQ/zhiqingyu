@@ -3,6 +3,7 @@ OpenAI Provider实现
 """
 import os
 from openai import OpenAI
+import httpx
 
 from app.core.providers.base_provider import JsonChatLLMProvider
 
@@ -12,14 +13,15 @@ class OpenAIProvider(JsonChatLLMProvider):
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
         super().__init__()
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = os.getenv("OPENAI_API_KEY") if api_key is None else api_key
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
         if not self.api_key:
             raise ValueError("API key is required for OpenAI provider")
 
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url,
+                             http_client=httpx.Client(timeout=60.0, follow_redirects=False), max_retries=1)
 
     def _perform_text_completion(self, chat_messages) -> str | dict:
         """
@@ -105,8 +107,7 @@ class OpenAIProvider(JsonChatLLMProvider):
             if result_text is None:
                 self.logger.error("[OpenAI Provider] API响应中content为None")
                 raise ValueError("API响应格式错误：content为None")
-            
-            self.logger.info(f"[OpenAI Provider] API响应: {result_text[:200]}...")  # 只记录前200字符
+
             
             # 提取tokens使用信息
             usage_info = {}
@@ -129,7 +130,7 @@ class OpenAIProvider(JsonChatLLMProvider):
             self.logger.error(f"[OpenAI Provider] API调用失败: {str(e)}", exc_info=True)
             # 记录完整的响应信息以便调试
             if 'response' in locals():
-                self.logger.error(f"[OpenAI Provider] 响应对象: {response}")
+                self.logger.error("[OpenAI Provider] Upstream request failed")
                 if hasattr(response, 'choices'):
                     self.logger.error(f"[OpenAI Provider] choices数量: {len(response.choices) if response.choices else 0}")
             raise

@@ -1,5 +1,6 @@
 #!/bin/bash
 # 前端启动脚本（Linux/Mac）
+set -e
 cd "$(dirname "$0")/../prototype-frontend"
 
 if [ ! -d "node_modules" ]; then

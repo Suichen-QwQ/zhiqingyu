@@ -432,9 +432,11 @@ onMounted(() => {
 
 // 加载会话列表
 const loadSessions = async () => {
+  const epoch = ++sessionListEpoch
   loadingSessions.value = true
   try {
     const response = await getSessions()
+    if (epoch !== sessionListEpoch) return
     if (response.error) {
       console.error('Failed to load sessions:', response.error)
       return
@@ -445,17 +447,22 @@ const loadSessions = async () => {
   } catch (error) {
     console.error('Error loading sessions:', error)
   } finally {
-    loadingSessions.value = false
+    if (epoch === sessionListEpoch) loadingSessions.value = false
   }
 }
 
 // 切换会话
+let viewEpoch = 0
+let sessionListEpoch = 0
+
 const handleSwitchSession = async (id: string) => {
   if (id === sessionId.value) return
 
+  const epoch = ++viewEpoch
   loading.value = true
   try {
     const response = await getSessionMessages(id)
+    if (epoch !== viewEpoch) return
     if (response.error) {
       message.error(`${t('common.error')}: ${response.error.message}`)
       return
@@ -475,15 +482,18 @@ const handleSwitchSession = async (id: string) => {
       scrollToBottom()
     }
   } catch (error) {
+    if (epoch !== viewEpoch) return
     console.error('Error loading session messages:', error)
     message.error(t('chat.sendFailed'))
   } finally {
-    loading.value = false
+    if (epoch === viewEpoch) loading.value = false
   }
 }
 
 // 新建对话
 const handleNewChat = () => {
+  viewEpoch++
+  loading.value = false
   sessionId.value = null
   messages.value = []
   todayEmotion.value = null
@@ -597,6 +607,7 @@ const handleSend = async () => {
   messages.value = newMessages
   const currentInput = input.value.trim()
   input.value = ''
+  const epoch = ++viewEpoch
   loading.value = true
 
   try {
@@ -607,12 +618,13 @@ const handleSend = async () => {
       ai_style: selectedAIStyle.value,
       chat_mode: selectedChatMode.value,
     })
+    if (epoch !== viewEpoch) { loadSessions(); return }
 
     if (response.error) {
       console.error('API Error:', response.error)
       message.error(`${t('common.error')}: ${response.error.message}`)
       // 恢复输入
-      input.value = currentInput
+      if (!input.value.trim()) input.value = currentInput
       return
     }
 
@@ -645,12 +657,13 @@ const handleSend = async () => {
       }
     }
   } catch (error) {
+    if (epoch !== viewEpoch) return
     console.error('Request failed:', error)
     message.error(t('chat.sendFailed'))
     // 恢复输入
-    input.value = currentInput
+    if (!input.value.trim()) input.value = currentInput
   } finally {
-    loading.value = false
+    if (epoch === viewEpoch) loading.value = false
   }
 }
 
@@ -663,11 +676,13 @@ const handleKeyPress = (e: KeyboardEvent) => {
 
 // 处理满意度按钮点击
 const handleSatisfaction = async (satisfied: boolean) => {
+  if (loading.value) return
   if (!sessionId.value) {
     message.error(t('chat.noSession') || '没有会话ID')
     return
   }
 
+  const epoch = ++viewEpoch
   loading.value = true
   
   // 立即隐藏最后一条AI消息的满意度按钮，防止重复点击
@@ -694,6 +709,7 @@ const handleSatisfaction = async (satisfied: boolean) => {
       ai_style: selectedAIStyle.value,
       chat_mode: selectedChatMode.value,
     })
+    if (epoch !== viewEpoch) { loadSessions(); return }
 
     if (response.error) {
       console.error('API Error:', response.error)
@@ -731,23 +747,27 @@ const handleSatisfaction = async (satisfied: boolean) => {
       }
     }
   } catch (error) {
+    if (epoch !== viewEpoch) return
     console.error('Satisfaction feedback failed:', error)
     message.error(t('chat.sendFailed'))
   } finally {
-    loading.value = false
+    if (epoch === viewEpoch) loading.value = false
   }
 }
 
 // 处理生成卡片按钮点击
 const handleGenerateCard = async () => {
+  if (loading.value) return
   if (!sessionId.value) {
     message.error(t('chat.noSession') || '没有会话ID')
     return
   }
 
+  const epoch = ++viewEpoch
   loading.value = true
   try {
     const response = await generateCard(sessionId.value)
+    if (epoch !== viewEpoch) { loadSessions(); return }
 
     if (response.error) {
       console.error('Generate Card Error:', response.error)
@@ -780,10 +800,11 @@ const handleGenerateCard = async () => {
       }
     }
   } catch (error) {
+    if (epoch !== viewEpoch) return
     console.error('Generate Card failed:', error)
     message.error(t('chat.generateCardFailed') || '生成卡片失败')
   } finally {
-    loading.value = false
+    if (epoch === viewEpoch) loading.value = false
   }
 }
 
@@ -915,6 +936,8 @@ const handleTemplateExport = () => {
 }
 
 onUnmounted(() => {
+  viewEpoch++
+  sessionListEpoch++
   document.body.style.overflow = previousBodyOverflow
   document.body.classList.remove(FULLSCREEN_BODY_CLASS)
 })
@@ -2537,7 +2560,7 @@ onUnmounted(() => {
 }
 
 /* 覆盖 HeartCard 组件内部的样式，确保在全屏模式下正确显示 */
-.heart-card-fullscreen :deep(.heart-card) {
+.heart-card-fullscreen .heart-card {
   width: 100% !important;
   min-height: 100% !important;
   padding: 48px 32px !important;
@@ -2549,7 +2572,7 @@ onUnmounted(() => {
 }
 
 /* 确保卡片内容区域可见 */
-.heart-card-fullscreen :deep(.card-content) {
+.heart-card-fullscreen .card-content {
   display: block !important;
   visibility: visible !important;
   opacity: 1 !important;

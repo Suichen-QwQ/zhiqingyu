@@ -232,7 +232,7 @@ export interface AIConfig {
   id: string
   provider: string
   is_active: boolean
-  api_key: string | null
+  has_key: boolean
   base_url: string | null
   model: string | null
   extra_config: Record<string, any> | null

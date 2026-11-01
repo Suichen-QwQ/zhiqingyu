@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.models import DailySummary, Message
 from app.core.llm_provider import LLMProvider
-from app.schemas.chat import ChatMessage
+from app.schemas.chat import ChatMessage, PromptMessage
 import json
 import logging
 
@@ -73,7 +73,7 @@ class DailySummaryService:
             )
             
             # 调用 LLM 生成总结
-            system_message = ChatMessage(role="system", content=prompt)
+            system_message = PromptMessage(role="system", content=prompt)
             llm_messages = [system_message] + chat_messages
             
             # 使用简单的文本生成方法
@@ -193,7 +193,7 @@ class DailySummaryService:
 请直接输出叙事文本，不要包含任何其他说明或格式标记。"""
             
             # 构建消息列表
-            system_message = ChatMessage(role="system", content=prompt)
+            system_message = PromptMessage(role="system", content=prompt)
             llm_messages = [system_message] + user_messages
             
             # 调用 LLM 生成叙事文本

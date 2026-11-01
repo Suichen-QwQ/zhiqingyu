@@ -1,5 +1,6 @@
 #!/bin/bash
 # 后端启动脚本（Linux/Mac）
+set -e
 cd "$(dirname "$0")/../prototype-backend"
 
 if [ ! -d "venv" ]; then

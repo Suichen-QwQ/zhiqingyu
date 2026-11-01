@@ -32,7 +32,7 @@ async def general_exception_handler(request: Request, exc: Exception):
             data=None,
             error=ErrorDetail(
                 code="INTERNAL_ERROR",
-                message=f"服务器内部错误: {str(exc)}"
+                message="服务器内部错误，请稍后重试"
             )
         ).model_dump()
     )

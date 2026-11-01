@@ -3,6 +3,7 @@ MiniMax Provider实现（兼容OpenAI API格式）
 """
 import os
 from openai import OpenAI
+import httpx
 
 from app.core.providers.base_provider import JsonChatLLMProvider
 
@@ -12,14 +13,15 @@ class MiniMaxProvider(JsonChatLLMProvider):
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
         super().__init__()
-        self.api_key = api_key or os.getenv("MINIMAX_API_KEY")
+        self.api_key = os.getenv("MINIMAX_API_KEY") if api_key is None else api_key
         self.base_url = base_url or os.getenv("MINIMAX_BASE_URL", "https://api.minimax.chat/v1")
         self.model = model or os.getenv("MINIMAX_MODEL", "abab6.5s-chat")
 
         if not self.api_key:
             raise ValueError("API key is required for MiniMax provider")
 
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url,
+                             http_client=httpx.Client(timeout=60.0, follow_redirects=False), max_retries=1)
 
     def _perform_text_completion(self, chat_messages) -> str | dict:
         """
@@ -71,6 +73,6 @@ class MiniMaxProvider(JsonChatLLMProvider):
         )
 
         result_text = response.choices[0].message.content
-        self.logger.info(f"[MiniMax Provider] API响应: {result_text}")
+
         return result_text
 

@@ -307,15 +307,7 @@ class JsonChatLLMProvider(LLMProvider):
         """
         输出发送给AI的系统提示词，方便在控制台查看。
         """
-        if not prompt:
-            return
-        header = f"[Prompt][{mode}] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
-        footer = "[Prompt] <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<"
-        message = f"{header}\n{prompt}\n{footer}"
-        # logger输出到控制台
-        self.logger.info(message)
-        # 直接打印一份，确保在未配置日志时也能看到
-        print(message)
+        self.logger.debug("[Prompt] mode=%s length=%d", mode, len(prompt or ""))
 
     def _parse_json_payload(self, payload: str) -> Dict[str, Any]:
         if payload is None:
@@ -360,9 +352,9 @@ class JsonChatLLMProvider(LLMProvider):
                 try:
                     return json.loads(extracted)
                 except json.JSONDecodeError:
-                    self.logger.error(f"[JSON Parser] 提取的JSON对象仍然无法解析: {extracted[:200]}")
+                    self.logger.error("[JSON Parser] 提取的JSON对象仍然无法解析")
                     raise ValueError(f"无法解析JSON：{str(e)}")
-            self.logger.error(f"[JSON Parser] 无法从文本中提取JSON对象: {text[:200]}")
+            self.logger.error("[JSON Parser] 无法从文本中提取JSON对象")
             raise ValueError(f"无法解析JSON：{str(e)}")
 
     def _extract_json_object(self, text: str) -> str | None:

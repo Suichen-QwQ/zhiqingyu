@@ -201,7 +201,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { format, subDays, parseISO } from 'date-fns'
 import { zhCN, enUS } from 'date-fns/locale'
@@ -259,10 +259,15 @@ const loadDailyList = async () => {
   }
 }
 
+let detailEpoch = 0
+onUnmounted(() => { detailEpoch++ })
+
 const loadDailyDetail = async (date: string) => {
+  const epoch = ++detailEpoch
   loading.value = true
   try {
     const response = await getDailyDetail(date)
+    if (epoch !== detailEpoch || date !== selectedDate.value) return
     if (response.error) {
       console.error('Error loading daily detail:', response.error)
       return
@@ -272,9 +277,10 @@ const loadDailyDetail = async (date: string) => {
       detail.value = response.data
     }
   } catch (error) {
+    if (epoch !== detailEpoch) return
     console.error('Failed to load daily detail:', error)
   } finally {
-    loading.value = false
+    if (epoch === detailEpoch) loading.value = false
   }
 }
 

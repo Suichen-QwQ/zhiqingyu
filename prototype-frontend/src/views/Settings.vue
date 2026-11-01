@@ -117,7 +117,7 @@
                 v-model:value="formData.api_key"
                 type="password"
                 show-password-on="click"
-                :placeholder="$t('settings.apiKeyPlaceholder')"
+                :placeholder="editingConfig?.has_key ? $t('settings.savedKeyPlaceholder') : $t('settings.apiKeyPlaceholder')"
                 :disabled="formData.provider === 'ollama'"
               />
               <template v-if="formData.provider === 'ollama'" #feedback>
@@ -215,7 +215,7 @@
               <div class="chart-title">{{ $t('settings.dailyUsage') }}</div>
               <div class="chart-container">
                 <div
-                  v-for="(day, index) in tokensStats.daily_usage"
+                  v-for="day in tokensStats.daily_usage"
                   :key="day.date"
                   class="chart-bar-wrapper"
                 >
@@ -337,7 +337,7 @@ const formRules: FormRules = {
   },
   api_key: {
     validator: (rule, value) => {
-      if (formData.value.provider === 'ollama') {
+      if (formData.value.provider === 'ollama' || editingConfig.value?.has_key) {
         return true
       }
       if (!value || value.trim() === '') {
@@ -482,7 +482,7 @@ const handleEditConfig = (config: AIConfig) => {
   editingConfig.value = config
   formData.value = {
     provider: config.provider,
-    api_key: config.api_key || '',
+    api_key: '',
     base_url: config.base_url || '',
     model: config.model || '',
   }

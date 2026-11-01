@@ -66,6 +66,6 @@ class OllamaProvider(JsonChatLLMProvider):
 
             result_data = response.json()
             result_text = result_data.get("message", {}).get("content", "{}")
-            self.logger.info(f"[Ollama Provider] API响应: {result_text}")
+
             return result_text
 

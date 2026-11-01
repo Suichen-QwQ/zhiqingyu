@@ -56,13 +56,13 @@ async def get_daily_list(
     except ValueError as e:
         error_detail = ErrorDetail(
             code="INVALID_DATE_FORMAT",
-            message=f"日期格式错误: {str(e)}"
+            message="日期格式错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
     except Exception as e:
         error_detail = ErrorDetail(
             code="DAILY_LIST_ERROR",
-            message=f"获取日记列表时发生错误: {str(e)}"
+            message="获取日记列表时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -225,12 +225,12 @@ async def get_daily_detail(
     except ValueError as e:
         error_detail = ErrorDetail(
             code="INVALID_DATE_FORMAT",
-            message=f"日期格式错误: {str(e)}"
+            message="日期格式错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
     except Exception as e:
         error_detail = ErrorDetail(
             code="DAILY_DETAIL_ERROR",
-            message=f"获取单日详情时发生错误: {str(e)}"
+            message="获取单日详情时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)

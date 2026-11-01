@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
+UMask=0077
 User=admin
 WorkingDirectory=/home/admin/zhiqingyu
 EnvironmentFile=/home/admin/zhiqingyu/.env.secret

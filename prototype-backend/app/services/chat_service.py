@@ -120,11 +120,8 @@ class ChatService:
             logger = logging.getLogger(__name__)
             logger.info("=" * 80)
             logger.info("[Chat Service] AI回复生成完成")
-            logger.info(f"  用户消息: {user_message.content if user_message else 'N/A'}")
             logger.info(f"  回复长度: {len(llm_result.reply)} 字符")
-            logger.info(f"  完整回复内容:\n{llm_result.reply}")
             logger.info(f"  情绪: {llm_result.emotion}, 强度: {llm_result.intensity}")
-            logger.info(f"  主题: {llm_result.topics}, 风险等级: {llm_result.risk_level}")
             logger.info(f"  对话模式: {updated_conversation_state.currentMode}, 当前步骤: {updated_conversation_state.currentStep}")
             logger.info("=" * 80)
         except Exception as e:
@@ -135,9 +132,7 @@ class ChatService:
             updated_conversation_state = ConversationState()  # 创建默认状态
             logger.info("=" * 80)
             logger.info("[Chat Service] AI回复生成完成（使用旧方法）")
-            logger.info(f"  用户消息: {user_message.content if user_message else 'N/A'}")
             logger.info(f"  回复长度: {len(llm_result.reply)} 字符")
-            logger.info(f"  完整回复内容:\n{llm_result.reply}")
             logger.info("=" * 80)
         
         # 7. 应用风险检测规则（二次检查）
@@ -166,8 +161,6 @@ class ChatService:
                     logger = logging.getLogger(__name__)
                     logger.warning(
                         f"回复质量检查失败: {check_result.reason}. "
-                        f"用户消息: {user_message.content[:50]}... "
-                        f"助手回复: {llm_result.reply[:50]}..."
                     )
                     # 注意：这里不阻止回复，只是记录日志
                     # 如果需要，可以在这里触发重新生成或使用默认回复
@@ -190,6 +183,7 @@ class ChatService:
             total_tokens=llm_result.total_tokens
         )
         self.db.add(assistant_message)
+        self.db.flush()  # The latest assistant turn must be included in summary queries.
         
         # 9. 更新或创建DailySummary
         self._update_daily_summary(
@@ -266,7 +260,7 @@ class ChatService:
                 total_weight = 0.0
                 
                 for idx, msg in enumerate(today_messages):
-                    if msg.intensity:
+                    if msg.intensity is not None:
                         # 权重：后面的消息权重更高（线性递增）
                         weight = (idx + 1) / total_messages
                         weighted_sum += msg.intensity * weight
@@ -288,7 +282,7 @@ class ChatService:
             for msg in today_emotions:
                 if msg.emotion:
                     # 强度越高，权重越大（1-10的强度，权重为强度值）
-                    weight = msg.intensity if msg.intensity else 5  # 默认权重为5
+                    weight = msg.intensity if msg.intensity is not None else 5  # 默认权重为5
                     emotion_scores[msg.emotion] = emotion_scores.get(msg.emotion, 0) + weight
             
             if emotion_scores:

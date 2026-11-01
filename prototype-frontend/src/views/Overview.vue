@@ -281,10 +281,14 @@ watch(days, () => {
   loadStats()
 })
 
+let statsEpoch = 0
+
 const loadStats = async () => {
+  const epoch = ++statsEpoch
   loading.value = true
   try {
     const response = await getStatsOverview(days.value)
+    if (epoch !== statsEpoch) return
     if (response.error) {
       console.error('Error loading stats:', response.error)
       return
@@ -294,9 +298,10 @@ const loadStats = async () => {
       stats.value = response.data
     }
   } catch (error) {
+    if (epoch !== statsEpoch) return
     console.error('Failed to load stats:', error)
   } finally {
-    loading.value = false
+    if (epoch === statsEpoch) loading.value = false
   }
 }
 

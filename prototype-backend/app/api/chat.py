@@ -52,7 +52,7 @@ async def chat(
         # 统一错误处理
         error_detail = ErrorDetail(
             code="CHAT_ERROR",
-            message=f"处理聊天请求时发生错误: {str(e)}"
+            message="处理聊天请求时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -104,7 +104,7 @@ async def get_sessions(
     except Exception as e:
         error_detail = ErrorDetail(
             code="SESSIONS_ERROR",
-            message=f"获取会话列表时发生错误: {str(e)}"
+            message="获取会话列表时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -153,7 +153,7 @@ async def get_session_messages(
     except Exception as e:
         error_detail = ErrorDetail(
             code="SESSION_MESSAGES_ERROR",
-            message=f"获取会话消息时发生错误: {str(e)}"
+            message="获取会话消息时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -322,7 +322,7 @@ async def generate_card(
     except Exception as e:
         error_detail = ErrorDetail(
             code="GENERATE_CARD_ERROR",
-            message=f"生成关心卡时发生错误: {str(e)}"
+            message="生成关心卡时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -361,6 +361,6 @@ async def delete_session(
         db.rollback()
         error_detail = ErrorDetail(
             code="DELETE_SESSION_ERROR",
-            message=f"删除会话时发生错误: {str(e)}"
+            message="删除会话时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)

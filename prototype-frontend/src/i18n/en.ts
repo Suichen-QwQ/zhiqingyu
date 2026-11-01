@@ -141,6 +141,7 @@ export default {
     provider: 'Provider',
     selectProvider: 'Select Provider',
     apiKey: 'API Key',
+    savedKeyPlaceholder: 'Key saved; leave blank to keep it',
     apiKeyPlaceholder: 'Please enter API key',
     baseUrl: 'Base URL',
     baseUrlPlaceholder: 'Please enter API base URL (optional)',

@@ -17,7 +17,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 
 # 创建数据目录
-RUN mkdir -p /app/data
+RUN useradd --uid 10001 --create-home appuser && mkdir -p /app/data && chown appuser:appuser /app/data
+ENV DATABASE_URL=sqlite:////app/data/zhiqingyu.db
+ENV PYTHONDONTWRITEBYTECODE=1
+USER appuser
 
 # 暴露端口
 EXPOSE 8000

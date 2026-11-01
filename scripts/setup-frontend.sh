@@ -6,7 +6,7 @@ cd "$(dirname "$0")/../prototype-frontend"
 echo "开始设置前端环境..."
 
 if ! command -v node &> /dev/null; then
-    echo "错误: 未找到 Node.js，请先安装 Node.js 18+"
+    echo "错误: 未找到 Node.js，请先安装 Node.js 24+"
     exit 1
 fi
 echo "Node.js 版本: $(node --version)"
@@ -17,7 +17,7 @@ if ! command -v pnpm &> /dev/null; then
 fi
 
 echo "安装前端依赖..."
-pnpm install
+pnpm install --frozen-lockfile
 
 if [ "$1" == "build" ]; then
     echo "构建生产版本..."

@@ -1031,6 +1031,61 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(snapshot['days'], 1)
         self.assertTrue(server.recall_missing(pid, months=60, ref_date='2026-11-01')['ok'])
 
+    def test_demo_mode_disables_external_search_and_voice(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'ZQY_DEMO': '1'}), patch.object(server, 'model_settings', side_effect=AssertionError('read real settings')):
+            self.assertEqual(server.web_search('private demo question'), [])
+            self.assertEqual(server.transcribe_azure(b'fake audio'), '')
+            with self.assertRaises(server.TTSError):
+                server.tts_synth_chunk('private demo text')
+            self.assertFalse(server.tts_voices_payload()['enabled'])
+
+    def test_tts_escapes_ssml_and_bounds_untrusted_voice_options(self):
+        from unittest.mock import patch
+        ssml = server._tts_ssml('<break/> & private text', 'voice', '+0%')
+        self.assertNotIn('<break/>', ssml)
+        self.assertIn('&lt;break/&gt;', ssml)
+        calls = []
+        def synth(text, voice, rate):
+            calls.append((text, voice, rate))
+            return b'audio', False
+        with patch.object(server, 'tts_synth_chunk', side_effect=synth):
+            data, stats = server.tts_synthesize('hello ' * 500, "voice\"/><script>", "rate\"/><script>")
+        self.assertTrue(data)
+        self.assertLessEqual(stats['chars'], server.TTS_MAX_CHARS)
+        self.assertTrue(all(len(c[0]) <= server.TTS_CHUNK_CHARS for c in calls))
+        self.assertTrue(all(c[1] == server.TTS_VOICE and c[2] == server.TTS_RATE for c in calls))
+
+    def test_launcher_demo_ignores_real_configuration_and_preserves_exit_code(self):
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location('local_launcher', ROOT / 'local-run.py')
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        captured = {}
+        def run_backend(*args, **kwargs):
+            captured.update(kwargs['env'])
+            self.assertNotEqual(captured['ZQY_SETTINGS_FILE'], str(DATA / 'settings.json'))
+            self.assertEqual(captured['DEEPSEEK_API_KEY'], 'sk-demo')
+            self.assertEqual(captured['ZQY_TTS_OFF'], '1')
+            self.assertNotIn('AZURE_SPEECH_KEY', captured)
+            return 7
+        with patch.object(launcher.sys, 'argv', ['local-run.py', '--demo', '--data', str(DATA / 'demo')]), \
+             patch.object(launcher, 'read_env', side_effect=AssertionError('demo read real env file')), \
+             patch.object(launcher, 'free_port', side_effect=[19092, 18120]), \
+             patch.object(launcher.subprocess, 'Popen'), patch.object(launcher.subprocess, 'call', side_effect=run_backend), \
+             patch.object(launcher.time, 'sleep'), patch.dict(os.environ, {'AZURE_SPEECH_KEY': 'fake-real-speech-key'}):
+            self.assertEqual(launcher.main(), 7)
+        self.assertFalse(Path(captured['ZQY_SETTINGS_FILE']).parent.exists())
+
+    def test_model_addresses_cannot_embed_credentials(self):
+        from unittest.mock import patch
+        for address in ('https://user:fake-secret@example.test/v1', 'https://example.test/v1?api_key=fake-secret',
+                        'https://example.test/v1#fake-secret', 'https://example.test:invalid/v1'):
+            with self.assertRaises(ValueError):
+                server.save_model_settings({'base_url': address, 'api_key': 'fake-key'})
+            with patch.object(server.urllib.request, 'build_opener', side_effect=AssertionError('unexpected request')):
+                self.assertFalse(server.probe_model_call(address, 'fake-key', 'test')['ok'])
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

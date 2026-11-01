@@ -13,7 +13,7 @@ class ClaudeProvider(JsonChatLLMProvider):
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
         super().__init__()
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.api_key = os.getenv("ANTHROPIC_API_KEY") if api_key is None else api_key
         self.base_url = base_url or os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
         self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
@@ -77,7 +77,7 @@ class ClaudeProvider(JsonChatLLMProvider):
                         }
                     return result_text
                 
-                raise ValueError(f"Unexpected Claude API response format: {result_data}")
+                raise ValueError("Unexpected Claude API response format")
         except Exception as e:
             self.logger.error(f"[Claude Provider] 文本生成失败: {str(e)}", exc_info=True)
             raise
@@ -128,7 +128,7 @@ class ClaudeProvider(JsonChatLLMProvider):
             # Claude返回格式：content[0].text
             if "content" in result_data and len(result_data["content"]) > 0:
                 result_text = result_data["content"][0]["text"]
-                self.logger.info(f"[Claude Provider] API响应: {result_text}")
+
                 
                 # 提取tokens使用信息
                 usage = result_data.get("usage", {})
@@ -143,5 +143,5 @@ class ClaudeProvider(JsonChatLLMProvider):
                     }
                 return result_text
             
-            raise ValueError(f"Unexpected Claude API response format: {result_data}")
+            raise ValueError("Unexpected Claude API response format")
 

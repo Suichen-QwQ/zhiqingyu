@@ -61,3 +61,8 @@ python local-run.py --demo
 记忆文件损坏时不会自动用旧镜像重建或当作空表；页面显示读取失败，普通写入停止。确认用归档覆盖修复时，先在记忆目录保留私有 `.zqy-memory-corrupt-*.bak` 原件。JSON/归档恢复、旧格式迁移、读取计数和置顶等操作会保留完整条目数与已有长文本。
 
 共同回忆的整理和读取固定绑定发起时的身份与时间范围，清空确认绑定原身份，过期响应不会覆盖新列表。回忆文件损坏时停止整理并保留原件；确认归档修复前会生成私有 `.zqy-recall-corrupt-*.bak` 备份。清空失败会如实提示失败。
+
+
+完整审查的修复范围、验证结果及待完成项目见 [REVIEW.md](REVIEW.md)。演示模式数据默认保存在 `.local-data/demo/`，模型设置仅在本次运行中保留，不复用真实服务配置。
+
+Vue/FastAPI 原型需要 Python 3.11+、Node.js 24+。旧版仅供单用户使用，默认监听本机；反向代理部署时设置 `PROTOTYPE_ALLOWED_HOSTS` 和 `PROTOTYPE_ALLOWED_ORIGINS`，配置 HTTPS 与身份验证。容器前端示例需挂载密码文件，后端数据库需挂载 `/app/data` 持久化目录。

@@ -1240,7 +1240,7 @@ const getCommonStyles = (): string => {
 }
 
 export const generateCardHtml = (cardData: CardData, template: CardTemplate = 'basic') => {
-  const title = cardData.theme?.trim() || '心灵之卡'
+  const title = (cardData.theme?.trim() || '心灵之卡').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!))
   const date = formatDate()
   const useThreePart = shouldUseThreePart(cardData)
   const sectionsHtml = useThreePart ? buildThreePartSections(cardData) : buildFiveStepSections(cardData)

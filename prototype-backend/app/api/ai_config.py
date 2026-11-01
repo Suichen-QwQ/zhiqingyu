@@ -42,7 +42,7 @@ async def get_ai_configs(db: Session = Depends(get_db)):
                 id=config.id,
                 provider=config.provider,
                 is_active=config.is_active,
-                api_key=config.api_key,  # 注意：实际生产环境应该隐藏或加密
+                has_key=bool(config.api_key),
                 base_url=config.base_url,
                 model=config.model,
                 extra_config=extra_config,
@@ -60,7 +60,7 @@ async def get_ai_configs(db: Session = Depends(get_db)):
     except Exception as e:
         error_detail = ErrorDetail(
             code="GET_CONFIG_ERROR",
-            message=f"获取AI配置时发生错误: {str(e)}"
+            message="获取AI配置时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -111,7 +111,7 @@ async def create_ai_config(
             id=db_config.id,
             provider=db_config.provider,
             is_active=db_config.is_active,
-            api_key=db_config.api_key,
+            has_key=bool(db_config.api_key),
             base_url=db_config.base_url,
             model=db_config.model,
             extra_config=extra_config,
@@ -125,7 +125,7 @@ async def create_ai_config(
         db.rollback()
         error_detail = ErrorDetail(
             code="CREATE_CONFIG_ERROR",
-            message=f"创建AI配置时发生错误: {str(e)}"
+            message="创建AI配置时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -146,6 +146,11 @@ async def update_ai_config(
             )
             return ApiResponse(data=None, error=error_detail)
         
+        # Credentials remain bound to the address at which they were configured.
+        if (config.base_url is not None and config.base_url.rstrip('/') != (db_config.base_url or '').rstrip('/')
+                and db_config.api_key and not (config.api_key or '').strip()):
+            return ApiResponse(data=None, error=ErrorDetail(code="NEW_KEY_REQUIRED",
+                               message="更换服务地址时请填写对应的新密钥"))
         # 更新字段
         if config.api_key is not None:
             db_config.api_key = config.api_key
@@ -175,7 +180,7 @@ async def update_ai_config(
             id=db_config.id,
             provider=db_config.provider,
             is_active=db_config.is_active,
-            api_key=db_config.api_key,
+            has_key=bool(db_config.api_key),
             base_url=db_config.base_url,
             model=db_config.model,
             extra_config=extra_config,
@@ -189,7 +194,7 @@ async def update_ai_config(
         db.rollback()
         error_detail = ErrorDetail(
             code="UPDATE_CONFIG_ERROR",
-            message=f"更新AI配置时发生错误: {str(e)}"
+            message="更新AI配置时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 
@@ -228,7 +233,7 @@ async def activate_ai_config(
             id=db_config.id,
             provider=db_config.provider,
             is_active=db_config.is_active,
-            api_key=db_config.api_key,
+            has_key=bool(db_config.api_key),
             base_url=db_config.base_url,
             model=db_config.model,
             extra_config=extra_config,
@@ -242,7 +247,7 @@ async def activate_ai_config(
         db.rollback()
         error_detail = ErrorDetail(
             code="ACTIVATE_CONFIG_ERROR",
-            message=f"激活AI配置时发生错误: {str(e)}"
+            message="激活AI配置时发生错误，请检查服务器配置"
         )
         return ApiResponse(data=None, error=error_detail)
 

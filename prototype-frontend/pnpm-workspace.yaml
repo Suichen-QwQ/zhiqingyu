@@ -3,3 +3,7 @@ allowBuilds:
   esbuild: true
   vue-demi: true
   vue-echarts: true
+
+# Patched glob parser; v10 and v11 expose the same named matching API.
+overrides:
+  "minimatch@>=10 <11": "^11.0.1"

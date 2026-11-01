@@ -2,6 +2,10 @@
 ZhiQingYu - AI情绪陪伴应用后端主入口
 """
 import logging
+import os
+os.umask(0o077)
+from urllib.parse import urlsplit
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -26,13 +30,32 @@ app = FastAPI(
 )
 
 # 配置CORS
+prototype_origins = [o.strip().rstrip('/') for o in os.getenv("PROTOTYPE_ALLOWED_ORIGINS", "http://localhost:5525,http://127.0.0.1:5525,http://localhost:3000,http://127.0.0.1:3000").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js默认端口
+    allow_origins=prototype_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Protect the single-user local API from hostile websites and DNS rebinding.
+@app.middleware("http")
+async def restrict_local_api(request: Request, call_next):
+    allowed_hosts = {h.strip().lower() for h in os.getenv("PROTOTYPE_ALLOWED_HOSTS", "localhost,127.0.0.1,::1").split(",")}
+    allowed_origins = {o.strip().rstrip('/') for o in os.getenv("PROTOTYPE_ALLOWED_ORIGINS", "http://localhost:5525,http://127.0.0.1:5525,http://localhost:3000,http://127.0.0.1:3000").split(",")}
+    try:
+        host = urlsplit("//" + request.headers.get("host", "")).hostname
+    except ValueError:
+        host = None
+    origin = request.headers.get("origin", "").rstrip('/')
+    own_origin = str(request.base_url).rstrip('/')
+    if host not in allowed_hosts or (origin and origin != own_origin and origin not in allowed_origins):
+        return JSONResponse(status_code=403, content={"data": None, "error": {"code": "ORIGIN_DENIED", "message": "Request origin denied"}})
+    if not origin and request.headers.get("sec-fetch-site") == "cross-site":
+        return JSONResponse(status_code=403, content={"data": None, "error": {"code": "ORIGIN_DENIED", "message": "Request origin denied"}})
+    return await call_next(request)
+
 
 # 注册错误处理器
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
@@ -53,5 +76,5 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.getenv("PROTOTYPE_HOST", "127.0.0.1"), port=8000)
 

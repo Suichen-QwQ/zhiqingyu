@@ -12,9 +12,9 @@
 - 多模型顺延：首选模型报错/超时/额度受限 → 按 settings.json 的 fallbacks 依次自动重试
 - LLM 全挂时返回 502 {error,error_detail,tried}（不编默认回复），
   流式则在正文位置发 event:error + done{failed:true}，前端渲染成可重试的提示条
-- 静态托管：本服务同时托管项目根目录（index.html / assets/* 等），
+- 静态托管：本服务同时托管 frontend/（index.html / assets/* 等），
   本地直接访问 http://<host>:<port>/ 即可打开网页，无需 nginx；
-  部署到 nginx 子路径（/zhiqingyu/）时仍可只反代 /api/chat
+  部署到 nginx 子路径（/zhiqingyu/）时须反代整个 /api/ 路径
 
 接口契约见 Hermes-接口契约.md，版本 2026-08-31。
 """
@@ -63,7 +63,7 @@ SETTINGS_LOCK = threading.RLock()
 # 云端数据：对话/日记/设置的整包 JSON（单用户全局，跨设备 + 清浏览器后可从云端恢复）
 STORAGE_FILE = os.environ.get('ZQY_STORAGE_FILE', os.path.join(SERVER_DIR, 'storage', 'zqy-data.json'))
 # 静态托管根：项目根目录（index.html 所在处）
-STATIC_DIR = os.environ.get('ZQY_STATIC_DIR', os.path.dirname(SERVER_DIR))
+STATIC_DIR = os.environ.get('ZQY_STATIC_DIR', os.path.join(os.path.dirname(SERVER_DIR), 'frontend'))
 
 # ---- 表情包：鸣潮官方表情（assets/emotes/manifest.json）----
 # LLM 在正文末尾用 ⟦表情名⟧ 标记（默认尽量配，仅在严肃/危机话题下不配），后端提取并映射成文件名。
@@ -2331,6 +2331,15 @@ class SettingsReadError(Exception):
     pass
 
 
+def _validate_model_base(value):
+    url = urllib.parse.urlsplit(value)
+    if (url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password
+            or url.query or url.fragment):
+        raise ValueError('Use an HTTP(S) service address without embedded credentials or query parameters')
+    url.port
+    return value
+
+
 def _saved_settings():
     """Missing settings use defaults; unreadable settings must fail closed."""
     try:
@@ -2346,6 +2355,11 @@ def _saved_settings():
     for field in ('base_url', 'model', 'reasoner_model', 'api_key'):
         if field in saved and saved[field] is not None and not isinstance(saved[field], str):
             raise SettingsReadError('invalid field in saved model settings')
+    if saved.get('base_url'):
+        try:
+            _validate_model_base(saved['base_url'])
+        except ValueError as e:
+            raise SettingsReadError('invalid saved model service address') from e
     if 'fallbacks' in saved and not isinstance(saved['fallbacks'], list):
         raise SettingsReadError('invalid fallbacks in saved model settings')
     return saved
@@ -2393,7 +2407,11 @@ def _chain_entry(raw, keep_id=''):
         return None
     base_url = str(raw.get('base_url') or '').strip().rstrip('/')
     model = str(raw.get('model') or '').strip()[:120]
-    if not re.match(r'^https?://', base_url) or not model:
+    try:
+        _validate_model_base(base_url)
+    except ValueError:
+        return None
+    if not model:
         return None
     rid = str(raw.get('id') or keep_id or '').strip()[:40]
     if not rid:
@@ -2614,7 +2632,7 @@ def _save_model_settings_locked(data):
         current = {'base_url': str(data['base_url']).strip().rstrip('/'), 'model': data['model'],
                    'reasoner_model': data.get('reasoner_model') or data['model'],
                    'api_key': data['api_key'], 'timeout': 60, 'fallbacks': []}
-    requested_base = str(data.get('base_url') or current['base_url']).strip().rstrip('/')
+    requested_base = _validate_model_base(str(data.get('base_url') or current['base_url']).strip().rstrip('/'))
     if requested_base != current['base_url'] and not str(data.get('api_key') or '').strip():
         raise ValueError('A new API key is required when changing the model service address')
     for key in ('base_url', 'model', 'reasoner_model', 'timeout'):
@@ -2684,8 +2702,10 @@ def probe_model_call(base_url, api_key, model, timeout=15, want_chat=False):
     base = str(base_url or '').strip().rstrip('/')
     out = {'ok': False, 'models': [], 'latency_ms': None, 'error': '',
            'models_ok': False, 'chat_ok': False}
-    if not re.match(r'^https?://', base):
-        out['error'] = u'地址要以 http(s):// 开头'
+    try:
+        _validate_model_base(base)
+    except ValueError:
+        out['error'] = u'请填写不含账号或密钥参数的 HTTP(S) 服务地址'
         return out
     headers = {'Authorization': 'Bearer ' + api_key} if api_key else {}
     started = time.time()
@@ -3330,6 +3350,8 @@ def web_search(query, n=3):
     返回 [{title,url,snippet}]；全部失败/超时 → []（调用方静默降级）。
     """
     q = str(query or '').strip()
+    if _env_flag('ZQY_DEMO', '0'):
+        return []
     if not q:
         return []
     official = _official_search_settings()
@@ -6424,7 +6446,7 @@ def _tts_cache_put(key, data):
 
 def tts_synth_chunk(text, voice=None, rate=None):
     u"""合成单块，返回 (mp3_bytes, cache_hit)。失败抛 TTSError。"""
-    if TTS_OFF:
+    if TTS_OFF or _env_flag('ZQY_DEMO', '0'):
         raise TTSError(u'语音功能暂时关掉了', 'ZQY_TTS_OFF=1')
     voice = (voice or TTS_VOICE).strip()
     rate = (rate or TTS_RATE).strip()
@@ -6489,7 +6511,7 @@ def tts_synthesize(text, voice=None, rate=None):
 
 def tts_voices_payload():
     return {'voices': [{'id': i, 'label': l} for i, l in TTS_VOICES],
-            'default': TTS_VOICE, 'enabled': bool(TTS_KEY) and not TTS_OFF}
+            'default': TTS_VOICE, 'enabled': bool(TTS_KEY) and not TTS_OFF and not _env_flag('ZQY_DEMO', '0')}
 
 
 
@@ -6500,6 +6522,8 @@ def transcribe_azure(wav_bytes, lang='zh-CN', rate=16000):
     用于浏览器/WebView 不支持内置语音识别的场景（如木函网页转APP 的安卓 WebView）：
     前端用 Web Audio 采 16k PCM 封装 wav，POST 到 /api/transcribe，后端走 Azure。
     """
+    if _env_flag('ZQY_DEMO', '0'):
+        return ''
     key = os.environ.get('AZURE_SPEECH_KEY')
     region = os.environ.get('AZURE_SPEECH_REGION') or 'eastasia'
     if not key or not wav_bytes:
@@ -7135,6 +7159,7 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
+    os.umask(0o077)
     try:
         if not model_settings().get('api_key'):
             sys.stderr.write('WARNING: 模型密钥未配置，请通过设置页面填写\n')

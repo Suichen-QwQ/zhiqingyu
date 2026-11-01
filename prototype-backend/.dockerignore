@@ -1,0 +1,11 @@
+node_modules
+dist
+venv
+.venv
+.git
+.env
+.env.*
+*.db
+*.sqlite*
+__pycache__
+*.pyc

@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.join(ROOT, 'backend-live')
@@ -66,6 +67,7 @@ def free_port(start, tries=20):
 
 
 def main():
+    os.umask(0o077)
     ap = argparse.ArgumentParser()
     ap.add_argument('--port', type=int, default=0, help='监听端口（默认 8092，被占用自动往后找）')
     ap.add_argument('--data', default='', help='数据目录（默认 .local-data/）')
@@ -84,8 +86,9 @@ def main():
         else:
             print('提示：没有 %s，将只使用系统环境变量。' % ENV_LOCAL)
 
-    cfg = read_env(ENV_LOCAL)
-    data_dir = os.path.abspath(args.data) if args.data else os.path.join(ROOT, '.local-data')
+    cfg = {} if args.demo else read_env(ENV_LOCAL)
+    default_data = os.path.join(ROOT, '.local-data', 'demo') if args.demo else os.path.join(ROOT, '.local-data')
+    data_dir = os.path.abspath(args.data) if args.data else default_data
     if not os.path.isdir(data_dir):
         os.makedirs(data_dir)
 
@@ -104,7 +107,14 @@ def main():
     env['PYTHONIOENCODING'] = 'utf-8'
 
     demo_proc = None
+    demo_config = None
     if args.demo:
+        demo_config = tempfile.TemporaryDirectory(prefix='zqy-demo-settings-')
+        env['ZQY_SETTINGS_FILE'] = os.path.join(demo_config.name, 'settings.json')
+        env['ZQY_DEMO'] = '1'
+        env['ZQY_TTS_OFF'] = '1'
+        for key in ('AZURE_SPEECH_KEY', 'AZURE_TTS_KEY', 'TAVILY_API_KEY', 'QIANFAN_API_KEY'):
+            env.pop(key, None)
         demo_port = free_port(18120)
         env['DEEPSEEK_BASE_URL'] = 'http://127.0.0.1:%d/v1' % demo_port
         env['DEEPSEEK_API_KEY'] = 'sk-demo'
@@ -116,8 +126,7 @@ def main():
         demo_proc = subprocess.Popen([sys.executable, DEMO_LLM, str(demo_port)])
         time.sleep(0.8)
     elif not env.get('DEEPSEEK_API_KEY'):
-        env['DEEPSEEK_API_KEY'] = 'sk-local-preview'   # 占位，保证服务能起来
-        print('注意：DEEPSEEK_API_KEY 为空，已用占位符启动 —— 页面能用，但发消息会失败。')
+        print('注意：DEEPSEEK_API_KEY 为空；页面仍可启动，请通过设置填写密钥。')
         print('     要看真实对话：把 key 填进 %s；或加 --demo 用假模型。' % ENV_LOCAL)
 
     print('=' * 62)
@@ -132,16 +141,22 @@ def main():
     print('=' * 62)
 
     try:
-        subprocess.call([sys.executable, SERVER], cwd=BACKEND, env=env)
+        return subprocess.call([sys.executable, SERVER], cwd=BACKEND, env=env)
     except KeyboardInterrupt:
         pass
     finally:
         if demo_proc:
             try:
                 demo_proc.terminate()
-            except Exception:
+                demo_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                demo_proc.kill()
+                demo_proc.wait()
+            except OSError:
                 pass
+        if demo_config:
+            demo_config.cleanup()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
