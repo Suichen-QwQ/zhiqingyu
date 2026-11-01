@@ -2314,6 +2314,7 @@
            不要在这里补文字，否则一回写就把统计污染回去了；展示时才用 it.theme||'此刻的心情' 补。 */
         if(typeof m.theme!=='string') m.theme='';
         if(typeof m.tide!=='boolean') m.tide=false;
+        if(m.queued===true)m.failed=true;
         if(m.failed!==true) m.failed=false;                /* 只有 true 才算失败态 */
         if(typeof m.reasoning!=='string') m.reasoning='';
         if(m.sources!==undefined&&!Array.isArray(m.sources)) m.sources=[];  /* bubbleEl 按 Array.isArray 判定 */
@@ -4028,30 +4029,34 @@
      找不到就是这一轮已经收尾了（409 no_active_turn）—— 这时退回原来的本地排队语义，
      行为与 P2 之前完全一致，不会丢话。 ---- */
   function inboxSend(sid,text){
-    const body={session_id:String(sid||''),message:String(text||'')};
+    const session=DB.sessions.find(s=>s.id===sid);
+    if(!session)return;
+    const message={id:uid(),role:'me',text:text,ts:Date.now(),failed:false,queued:true};
+    session.msgs.push(message);dbSave();
+    function paint(){
+      if(DB.activeId!==sid||!DB.sessions.includes(session))return;
+      const existing=msgsBox.querySelector('[data-id="'+message.id+'"]');
+      if(existing)existing.replaceWith(bubbleEl(message));
+      else msgsBox.insertBefore(bubbleEl(message),thinkEl);
+      scrollChat(true);
+    }
+    paint();
     const fallback=function(hint){
-      const session=DB.sessions.find(s=>s.id===sid);
-      if(!session)return;
-      const message={id:uid(),role:'me',text:text,ts:Date.now(),failed:true,queued:true};
-      session.msgs.push(message);pendingQueue.push({sid:sid,id:message.id,text:text});dbSave();
-      if(DB.activeId===sid){
-        if(window.zqyRenderSession)window.zqyRenderSession();
-        if(hint)showToast(hint);
-        flushQueue();
-      }
+      if(!DB.sessions.includes(session))return;
+      message.failed=true;message.queued=true;
+      pendingQueue.push({sid:sid,id:message.id,text:text});dbSave();paint();
+      if(DB.activeId===sid){if(hint)showToast(hint);flushQueue();}
     };
     fetch('api/inbox',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body)})
-      .then(function(r){
-        return r.json().catch(function(){ return null; }).then(function(d){
-          if(r&&r.ok){ showToast('已经补进这一轮了'); return; }
-          const code=String((d&&d.error_code)||'');
-          if(code==='no_active_turn') fallback('这一轮已经说完了，等它收尾就发出去');
-          else if(code==='empty_text') showToast('这句没写内容，没发出去');
-          else fallback('插不进去，等这一轮结束再发');
-        });
-      })
-      .catch(function(){ fallback('插不进去，等这一轮结束再发'); });
+      body:JSON.stringify({session_id:String(sid||''),message:String(text||'')})})
+      .then(async function(response){
+        const data=await response.json().catch(()=>null);
+        if(!DB.sessions.includes(session))return;
+        if(response.ok&&data&&data.queued){
+          message.failed=false;delete message.queued;dbSave();paint();
+          if(DB.activeId===sid)showToast('已经补进这一轮了');
+        }else fallback('这一轮已收尾或插话已满，将作为下一轮发送');
+      }).catch(()=>fallback('插话没送到，将作为下一轮发送'));
   }
   function sendMsg(){
     const text=inputEl.value.trim();
@@ -5418,8 +5423,8 @@
         showToast(String(data.error||'这个包读不出来，可能不是有效的归档包'));
         return;
       }
-      const memN=Array.isArray(data.memories)?data.memories.length:0;
-      const recN=Array.isArray(data.recall)?data.recall.length:0;
+      const memN=Array.isArray(data.memories)?data.memories.filter(x=>x.result==='restored').length:0;
+      const recN=Array.isArray(data.recall)?data.recall.filter(x=>x.result==='restored').length:0;
       if(data.storage==='skipped_has_data'&&!force){
         /* 云端已经有对话了：如实问一句，绝不静默覆盖用户唯一的对话记录 */
         const go=await zqyConfirm({title:'云端已经有对话数据了',

@@ -17,6 +17,8 @@ STATIC = DATA / 'frontend'
 (DATA / 'storage.json').write_text(json.dumps({'data': {'sessions': [{'msgs': ['private-test']}]}}))
 os.environ.update({'ZQY_STATIC_DIR': str(STATIC), 'ZQY_STORAGE_FILE': str(DATA / 'storage.json'),
                    'ZQY_SETTINGS_FILE': str(DATA / 'settings.json'), 'ZQY_MEMORY_DIR': str(DATA / 'memory'),
+                   'ZQY_RECALL_DIR': str(DATA / 'recall'), 'ZQY_MEMORY_FILE': str(DATA / 'memory.md'),
+                   'ZQY_TTS_CACHE_DIR': str(DATA / 'tts'),
                    'DEEPSEEK_API_KEY': 'fake-review-key', 'DEEPSEEK_BASE_URL': 'http://127.0.0.1:19991'})
 spec = importlib.util.spec_from_file_location('review_server', ROOT / 'backend-live' / 'chat_server.py')
 server = importlib.util.module_from_spec(spec)
@@ -477,6 +479,218 @@ class SecurityTests(unittest.TestCase):
                 self.assertEqual(set(facts), {'updated fact', 'new fact'})
                 self.assertEqual(result['updated'], ['updated fact'])
                 self.assertTrue(result['added'])
+
+    def test_archive_preflight_rejects_bad_later_entry_before_writing_storage(self):
+        import io
+        import zipfile
+        revision = server.read_storage()['revision']
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('storage.json', json.dumps({'sessions': [{'msgs': ['new data']}]}))
+            zf.writestr('memories/invalid.json', json.dumps({'items': 'not an array'}))
+        result = server.archive_import(archive.getvalue(), True)
+        self.assertFalse(result['ok'])
+        self.assertEqual(server.read_storage()['revision'], revision)
+
+    def test_archive_empty_and_failed_storage_write_are_not_success(self):
+        import io
+        import zipfile
+        from unittest.mock import patch
+        for files in ({'unrecognized.txt': 'ignored'}, {'manifest.json': '{}'}):
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, 'w') as zf:
+                for key, value in files.items():
+                    zf.writestr(key, value)
+            self.assertFalse(server.archive_import(archive.getvalue(), True)['ok'])
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('storage.json', json.dumps({'sessions': []}))
+        with patch.object(server, 'put_storage', return_value=None):
+            self.assertFalse(server.archive_import(archive.getvalue(), True)['ok'])
+
+    def test_archive_export_does_not_silently_omit_unreadable_storage(self):
+        from unittest.mock import patch
+        with patch.object(server, 'read_storage', side_effect=OSError('simulated read failure')):
+            status, _, body = self.request('GET', '/api/archive')
+        self.assertEqual(status, 500)
+        self.assertIn(b'no complete backup', body)
+
+    def test_inbox_ownership_late_messages_and_capacity(self):
+        from unittest.mock import patch
+        sid = 'owned-inbox'
+        owner = server._inbox_begin(sid)
+        self.assertIsNot(owner, False)
+        self.assertIs(server._inbox_begin(sid), False)
+        for i in range(server.INBOX_MAX):
+            self.assertTrue(server.inbox_queue(sid, 'message %s' % i)['queued'])
+        self.assertFalse(server.inbox_queue(sid, 'overflow')['queued'])
+        self.assertFalse(server.inbox_queue(sid, 'x'*(server.INBOX_ITEM_CHARS+1))['queued'])
+        self.assertEqual(len(server._inbox_take(sid, owner)), server.INBOX_MAX)
+        self.assertFalse(server.inbox_queue(sid, 'late')['queued'])
+        with server.INBOX_LOCK:
+            server.INBOX[sid]['until'] = 0
+        replacement = server._inbox_begin(sid)
+        server._inbox_end(sid, owner)
+        self.assertTrue(server.inbox_queue(sid, 'new owner message')['queued'])
+        self.assertEqual(server._inbox_take(sid, owner), [])
+        self.assertEqual(server._inbox_take(sid, replacement), ['new owner message'])
+        server._inbox_end(sid, replacement)
+        self.assertNotIn(sid, server.INBOX)
+
+    def test_sse_disconnect_explicitly_closes_retained_generator(self):
+        closed = []
+        def events():
+            try:
+                yield 'event: delta\ndata: {}\n\n'
+                yield 'event: done\ndata: {}\n\n'
+            finally:
+                closed.append(True)
+        class BrokenWriter:
+            def write(self, body):
+                raise BrokenPipeError()
+        handler = object.__new__(server.Handler)
+        handler.send_response = lambda *args: None
+        handler.send_header = lambda *args: None
+        handler.end_headers = lambda: None
+        handler.wfile = BrokenWriter()
+        retained = events()
+        handler._send_sse(retained)
+        self.assertEqual(closed, [True])
+        self.assertEqual(list(retained), [])
+
+    def test_legacy_memory_archive_round_trip_is_immediately_readable(self):
+        import io
+        import zipfile
+        from unittest.mock import patch
+        pid = 'legacy-archive-roundtrip'
+        with patch.object(server, 'MEMORY_V2', False):
+            server.replace_profile_memory(pid, ['2026-11-01 09:00 legacy archive fact'])
+            archive = server.archive_export(pid)
+            with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+                memory = json.loads(zf.read('memories/' + pid + '.json'))
+                self.assertEqual(memory['items'][0]['text'], 'legacy archive fact')
+            server.clear_profile_memory(pid)
+            result = server.archive_import(archive, True)
+            self.assertTrue(result['ok'])
+            self.assertIn('legacy archive fact', server.profile_memory_items(pid)[0])
+            with patch.object(server, 'MEMORY_V2', True):
+                self.assertEqual(server._mem_load_v2(pid)['items'][0]['text'], 'legacy archive fact')
+
+    def test_memory_archive_preserves_active_legacy_data_over_stale_json(self):
+        import io
+        import zipfile
+        from unittest.mock import patch
+        pid = 'stale-json-archive'
+        with patch.object(server, 'MEMORY_V2', True):
+            server.replace_profile_memory(pid, [{'text': 'stale structured fact'}])
+        with patch.object(server, 'MEMORY_V2', False):
+            server.replace_profile_memory(pid, ['current legacy fact'])
+            archive = server.archive_export(pid)
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            data = json.loads(zf.read('memories/' + pid + '.json'))
+        self.assertEqual([item['text'] for item in data['items']], ['current legacy fact'])
+
+    def test_default_memory_archive_import_does_not_shadow_existing_legacy_file(self):
+        import io
+        import zipfile
+        from unittest.mock import patch
+        pid = 'keep-legacy-on-import'
+        with patch.object(server, 'MEMORY_V2', False):
+            server.replace_profile_memory(pid, ['live legacy fact'])
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, 'w') as zf:
+                zf.writestr('memories/' + pid + '.json', json.dumps({'items': [{'text': 'imported fact'}]}))
+            result = server.archive_import(archive.getvalue(), False)
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['memories'][0]['result'], 'skipped_exists')
+            self.assertEqual(server.profile_memory_items(pid), ['live legacy fact'])
+            self.assertFalse(os.path.exists(server._mem_json_path(pid)))
+
+    def test_memory_archive_preserves_long_facts_and_all_imported_entries(self):
+        import io
+        import zipfile
+        from unittest.mock import patch
+        pid = 'full-legacy-archive'
+        facts = ['2026-11-01 09:00 fact %s %s' % (i, 'x'*150) for i in range(server.MEM_MAX_ITEMS+3)]
+        with patch.object(server, 'MEMORY_V2', False):
+            with server.MEM_LOCK:
+                server._atomic_write_memory(pid, facts)
+            archive = server.archive_export(pid)
+            server.clear_profile_memory(pid)
+            self.assertTrue(server.archive_import(archive, True)['ok'])
+            restored = server.profile_memory_items(pid)
+        self.assertEqual(restored, facts)
+
+    def test_overlapping_stream_rejected_and_inner_generator_closed(self):
+        from unittest.mock import patch
+        closed = []
+        def inner():
+            try:
+                yield 'event: delta\ndata: {}\n\n'
+                yield 'event: done\ndata: {}\n\n'
+            finally:
+                closed.append(True)
+        retained = inner()
+        with patch.object(server, '_stream_chat_inner', return_value=retained):
+            first = server.stream_chat({'session_id': 'duplicate-stream'})
+            next(first)
+            second = list(server.stream_chat({'session_id': 'duplicate-stream'}))
+            self.assertIn('session_busy', ''.join(second))
+            first.close()
+        self.assertEqual(closed, [True])
+        self.assertNotIn('duplicate-stream', server.INBOX)
+
+    def test_demo_model_full_sse_flow(self):
+        import subprocess
+        import sys
+        import socket
+        import time
+        from unittest.mock import patch
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        demo = subprocess.Popen([sys.executable, str(ROOT / 'scripts/demo_llm.py'), str(port)],
+                                env=dict(os.environ, PYTHONIOENCODING='utf-8'),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                self.assertIsNone(demo.poll())
+                try:
+                    with socket.create_connection(('127.0.0.1', port), timeout=0.2):
+                        break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            with patch.object(server, 'BASE_URL', 'http://127.0.0.1:%s/v1' % port):
+                payload = json.dumps({'message': 'hello', 'stream': True, 'session_id': 'demo-smoke',
+                                      'profile_id': 'demo-smoke', 'search': False, 'memorize': False}).encode()
+                status, _, raw = self.request('POST', '/api/chat', payload, {'Content-Type': 'application/json'})
+            self.assertEqual(status, 200)
+            self.assertIn(b'event: delta', raw)
+            self.assertIn(b'event: done', raw)
+            self.assertNotIn(b'"failed": true', raw)
+            self.assertNotIn('demo-smoke', server.INBOX)
+        finally:
+            demo.terminate()
+            demo.wait(timeout=5)
+
+    def test_archive_reserved_profile_names_keep_their_memory_namespace(self):
+        import io
+        import zipfile
+        revision = server.read_storage()['revision']
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('memories/storage.json', json.dumps({'items': [{'text': 'scoped memory'}]}))
+            zf.writestr('memories/manifest.json', json.dumps({'items': [{'text': 'another memory'}]}))
+        result = server.archive_import(archive.getvalue(), True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(len(result['memories']), 2)
+        self.assertEqual(server.read_storage()['revision'], revision)
+        self.assertEqual(server._archive_key('wrapped/memories/storage.json'), 'memories/storage.json')
+        self.assertEqual(server._archive_key('memories/../storage.json'), '')
+        self.assertEqual(server._archive_key('memories/user.name.json'), '')
 
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})

@@ -1096,7 +1096,7 @@ def _mem_evict_key(item):
     return (max(1, min(5, imp)), str(item.get('created') or ''), str(item.get('id') or ''))
 
 
-def _mem_save_v2(profile_id, data, migrate=False):
+def _mem_save_v2(profile_id, data, migrate=False, enforce_limit=True):
     """原子写 JSON（真身）+ 同步镜像 md；migrate=True 时把旧 md 另存 .md.bak。
 
     整段持 MEM_LOCK（RLock，可重入）：临时文件名是固定后缀，两个写者同时进来会互相
@@ -1105,7 +1105,7 @@ def _mem_save_v2(profile_id, data, migrate=False):
     """
     items = [it for it in (data.get('items') or []) if isinstance(it, dict) and it.get('text')]
     dropped_items = []
-    if len(items) > MEM_MAX_ITEMS:
+    if enforce_limit and len(items) > MEM_MAX_ITEMS:
         pinned = [it for it in items if it.get('pinned')]
         rest = [it for it in items if not it.get('pinned')]
         rest.sort(key=_mem_evict_key)          # 升序：imp 低的在前、同龄时旧的在前
@@ -3604,15 +3604,24 @@ def stream_chat(payload):
     之后用户正常发消息会被误判成「对上一轮的补充」塞进队列。
     """
     _sid = str(payload.get('session_id') or payload.get('session') or '').strip()[:64]
-    _inbox_begin(_sid)
+    owner = _inbox_begin(_sid)
+    if owner is False:
+        error = {'error': '这个会话正在生成回复，请稍后重试', 'error_code': 'session_busy'}
+        yield 'event: error\ndata: %s\n\n' % json_dumps(error, ensure_ascii=False)
+        yield 'event: done\ndata: %s\n\n' % json_dumps(dict(error, failed=True), ensure_ascii=False)
+        return
+    inner = _stream_chat_inner(payload, owner)
     try:
-        for ev in _stream_chat_inner(payload):
+        for ev in inner:
             yield ev
     finally:
-        _inbox_end(_sid)
+        try:
+            inner.close()
+        finally:
+            _inbox_end(_sid, owner)
 
 
-def _stream_chat_inner(payload):
+def _stream_chat_inner(payload, inbox_owner=None):
     """真流式聊天（含深度思考）+ 联网搜索【模型自主】。
 
     带 web_search 工具流式，模型需要搜索时该轮只有 tool_calls（无文本），
@@ -3860,7 +3869,7 @@ def _stream_chat_inner(payload):
     # 这时候去「接着刚才的话说」只会得到第二段空回复，把一次失败变成两次。
     _cont = 0
     while _sid and _cont < 1 and text.strip():
-        _adds = _inbox_take(_sid)
+        _adds = _inbox_take(_sid, inbox_owner)
         if not _adds:
             break
         _cont += 1
@@ -4455,7 +4464,7 @@ ASK_WAIT = {}           # ask_id -> {'ev': Event, 'data': dict}
 _ASK_SEQ = [0]
 INBOX_LOCK = threading.Lock()
 INBOX = {}              # session_id -> {'items': [], 'active': bool, 'until': ts, 'seq': n}
-INBOX_MAX = 5
+INBOX_MAX = 3
 INBOX_ITEM_CHARS = 600
 INBOX_ACTIVE_TTL = 900  # 一轮最多算「活跃」15 分钟，客户端断连后自然失效
 
@@ -4605,18 +4614,20 @@ def inbox_queue(session_id, text):
     if not sid:
         return {'queued': False, 'error': u'缺少 session_id',
                 'error_code': 'no_session'}
-    t = re.sub(r'\s+', u' ', str(text or '')).strip()[:INBOX_ITEM_CHARS]
+    t = re.sub(r'\s+', u' ', str(text or '')).strip()
     if not t:
         return {'queued': False, 'error': u'内容为空', 'error_code': 'empty_text'}
+    if len(t) > INBOX_ITEM_CHARS:
+        return {'queued': False, 'error': 'inbox message too long', 'error_code': 'inbox_too_long'}
     with INBOX_LOCK:
         d = INBOX.get(sid)
-        if not d or not d.get('active') or time.time() > float(d.get('until') or 0):
+        if not d or not d.get('active') or not d.get('accepting') or time.time() > float(d.get('until') or 0):
             return {'queued': False,
                     'error': u'这一轮已经结束了，直接正常发送就好',
                     'error_code': 'no_active_turn'}
         items = d['items']
         if len(items) >= INBOX_MAX:
-            items.pop(0)   # 满了丢最早的：宁可漏一句，也不让内存无上限
+            return {'queued': False, 'error': 'inbox is full', 'error_code': 'inbox_full'}
         d['seq'] = int(d.get('seq') or 0) + 1
         items.append({'text': t, 'at': int(time.time()), 'seq': d['seq']})
         return {'queued': True, 'seq': d['seq'], 'pending': len(items)}
@@ -4625,39 +4636,35 @@ def inbox_queue(session_id, text):
 def _inbox_begin(session_id):
     sid = str(session_id or '').strip()[:64]
     if not sid:
-        return
+        return None
     with INBOX_LOCK:
-        d = INBOX.get(sid)
-        if d is None:
-            d = INBOX[sid] = {'items': [], 'seq': 0}
-        d['active'] = True
-        d['until'] = time.time() + INBOX_ACTIVE_TTL
+        current = INBOX.get(sid)
+        if current and current.get('active') and time.time() <= current.get('until', 0):
+            return False
+        owner = object()
+        INBOX[sid] = {'items': [], 'seq': 0, 'active': True, 'accepting': True,
+                      'until': time.time() + INBOX_ACTIVE_TTL, 'owner': owner}
+        return owner
 
 
-def _inbox_end(session_id):
+def _inbox_end(session_id, owner=None):
     sid = str(session_id or '').strip()[:64]
-    if not sid:
-        return
     with INBOX_LOCK:
-        d = INBOX.get(sid)
-        if d is not None:
-            d['active'] = False
-            if not d.get('items'):
-                INBOX.pop(sid, None)   # 不留空壳，字典不随会话数膨胀
+        current = INBOX.get(sid)
+        if current and current.get('owner') is owner:
+            INBOX.pop(sid, None)
 
 
-def _inbox_take(session_id):
-    """取走这一轮期间攒下的插话（最多 3 条，防止一口气续写几轮）。"""
+def _inbox_take(session_id, owner=None):
     sid = str(session_id or '').strip()[:64]
-    if not sid:
-        return []
     with INBOX_LOCK:
-        d = INBOX.get(sid)
-        if not d:
+        current = INBOX.get(sid)
+        if not current or current.get('owner') is not owner:
             return []
-        items = d.get('items') or []
-        d['items'] = []
-    return [it['text'] for it in items if it.get('text')][:3]
+        current['accepting'] = False
+        items = current.get('items') or []
+        current['items'] = []
+        return [item['text'] for item in items if item.get('text')]
 
 
 # 提问卡片工具：只在【流式】路径挂出去（见 tool_specs(groups=('search', 'ask'))），
@@ -5726,36 +5733,54 @@ def _archive_name():
     return 'zqy-archive-%s.zip' % time.strftime('%Y%m%d-%H%M%S')
 
 
+def _archive_memory_item(raw):
+    if not isinstance(raw, (dict, str)):
+        return None
+    item = _mem_norm_item(raw)
+    if item:
+        if isinstance(raw, dict):
+            text = str(raw.get('text') or raw.get('fact') or '').strip()
+        else:
+            _stamp, text = _mem_split_ts(raw)
+        item['text'] = text  # Backups must not apply the runtime fact-length cap.
+    return item
+
+
 def _archive_scan(directory, prefix):
-    """把一个目录下的 *.json 读成 {zip内路径: 文本}；读不了就跳过，不中断导出。"""
+    """Read a complete snapshot; unreadable files must not silently disappear."""
     out = {}
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError:
-        return out
-    for n in names:
-        if not n.lower().endswith('.json') or not _ARCHIVE_NAME_RE.match(n):
-            continue
-        p = os.path.join(directory, n)
-        if not os.path.isfile(p):
-            continue
+    lock = MEM_LOCK if prefix == 'memories/' else _RECALL_LOCK
+    with lock:
         try:
-            with open(p, 'r', encoding='utf-8') as f:
-                out[prefix + n] = f.read()
-        except Exception as e:
-            sys.stderr.write('[archive] 跳过 %s: %s\n' % (p, str(e)[:120]))
+            names = sorted(os.listdir(directory))
+        except FileNotFoundError:
+            return out
+        for name in names:
+            if not name.lower().endswith('.json') or not _ARCHIVE_NAME_RE.match(name):
+                continue
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    out[prefix + name] = f.read()
+        if prefix == 'memories/':
+            for name in names:
+                if not name.endswith('.md') or not _ARCHIVE_NAME_RE.match(name[:-3] + '.json'):
+                    continue
+                key = prefix + name[:-3] + '.json'
+                if MEMORY_V2 and key in out:
+                    continue
+                with open(os.path.join(directory, name), 'r', encoding='utf-8') as f:
+                    lines = [line.strip()[2:].strip() for line in f.read().splitlines() if line.strip().startswith('- ')]
+                items = [_archive_memory_item(line) for line in lines]
+                out[key] = json_dumps({'v': 2, 'items': [item for item in items if item]}, ensure_ascii=False)
     return out
 
 
 def archive_export(profile_id='default'):
     """打包 → zip bytes。空数据也照样出包（manifest 里如实写 0 个文件）。"""
     files = {}
-    data = None
-    try:
-        st = read_storage()
-        data = st.get('data') if isinstance(st, dict) else None
-    except Exception as e:
-        sys.stderr.write('[archive] 读 storage 失败: %s\n' % str(e)[:120])
+    st = read_storage()
+    data = st.get('data') if isinstance(st, dict) else None
     # 一条数据都没有时不要塞 storage.json：内容会是 null，导入时被当成非法 JSON 丢掉，
     # 与 manifest 里「0 个文件」自相矛盾。空包就该是空包。
     if data is not None:
@@ -5770,12 +5795,26 @@ def archive_export(profile_id='default'):
     buf = io.BytesIO()
     zf = zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED)
     try:
+        total = 0
         for name in sorted(files):
-            zf.writestr(strip_lone_surrogates(name),
-                        strip_lone_surrogates(files[name]))
+            raw = strip_lone_surrogates(files[name]).encode('utf-8')
+            total += len(raw)
+            if len(raw) > _ARCHIVE_ENTRY_MAX or total > _ARCHIVE_TOTAL_MAX:
+                raise ValueError('backup exceeds archive restore limits; use JSON export')
+            obj = json.loads(raw.decode('utf-8'))
+            if name == 'storage.json' and not valid_storage_data(obj):
+                raise ValueError('invalid storage data in backup')
+            if name.startswith('memories/') and (not isinstance(obj, dict) or not isinstance(obj.get('items'), list) or not all(_archive_memory_item(item) for item in obj['items'])):
+                raise ValueError('invalid memory data in backup')
+            if name.startswith('recall/') and (not isinstance(obj, dict) or not isinstance(obj.get('items'), dict)):
+                raise ValueError('invalid recall data in backup')
+            zf.writestr(strip_lone_surrogates(name), raw)
     finally:
         zf.close()
-    return buf.getvalue()
+    result = buf.getvalue()
+    if len(result) > ARCHIVE_MAX_BYTES:
+        raise ValueError('backup exceeds compressed archive limit; use JSON export')
+    return result
 
 
 def _archive_key(name):
@@ -5783,17 +5822,21 @@ def _archive_key(name):
 
     兼容「整包外面又套了一层目录」（用系统压缩工具重打包时很常见）：只认最后两段。
     """
-    parts = [p for p in str(name or '').replace('\\', '/').split('/')
-             if p not in ('', '.', '..')]
+    raw_parts = str(name or '').replace('\\', '/').split('/')
+    if '..' in raw_parts:
+        return ''
+    parts = [part for part in raw_parts if part not in ('', '.')]
     if not parts:
         return ''
     leaf = parts[-1]
     if not _ARCHIVE_NAME_RE.match(leaf):
         return ''
+    if len(parts) >= 2 and parts[-2] in ('memories', 'recall'):
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}\.json', leaf):
+            return ''
+        return parts[-2] + '/' + leaf
     if leaf in ('storage.json', 'manifest.json'):
         return leaf
-    if len(parts) >= 2 and parts[-2] in ('memories', 'recall'):
-        return parts[-2] + '/' + leaf
     return ''
 
 
@@ -5834,71 +5877,86 @@ def archive_import(blob, force=False):
     out = {'ok': True, 'storage': 'skipped_has_data', 'memories': [],
            'recall': [], 'skipped': [], 'manifest': None}
     total = 0
+    entries = []
+    seen = set()
+    # Validate every recognized entry before changing any user file.
     try:
-        infos = zf.infolist()
-    except Exception as e:
-        return {'ok': False, 'error': u'压缩包读不出来（%s）' % str(e)[:80],
-                'error_code': 'archive_bad_zip'}
-    try:
-        for info in infos:
+        for info in zf.infolist():
             if getattr(info, 'is_dir', lambda: False)():
                 continue
             key = _archive_key(info.filename)
             if not key:
                 out['skipped'].append(str(info.filename)[:120])
                 continue
-            size = int(getattr(info, 'file_size', 0) or 0)
-            if size > _ARCHIVE_ENTRY_MAX or total + size > _ARCHIVE_TOTAL_MAX:
-                out['skipped'].append(key + '（过大）')
-                continue
-            try:
-                text = zf.read(info).decode('utf-8')
-            except Exception:
-                out['skipped'].append(key + '（读不出）')
-                continue
-            total += len(text)
+            if key in seen:
+                raise ValueError('duplicate archive entry: ' + key)
+            seen.add(key)
+            if info.file_size > _ARCHIVE_ENTRY_MAX or total + info.file_size > _ARCHIVE_TOTAL_MAX:
+                raise ValueError('archive data exceeds expanded size limit')
+            raw = zf.read(info)
+            total += len(raw)
+            text = raw.decode('utf-8')
+            obj = json.loads(text)
             if key == 'manifest.json':
-                m = extract_json_obj(text)
-                if isinstance(m, dict):
-                    out['manifest'] = {
-                        'v': m.get('v'), 'created_at': m.get('created_at'),
-                        'files': len(m.get('files') or [])}
+                if not isinstance(obj, dict):
+                    raise ValueError('invalid archive manifest')
+                out['manifest'] = {'v': obj.get('v'), 'created_at': obj.get('created_at'),
+                                   'files': len(obj.get('files') or [])}
                 continue
             if key == 'storage.json':
-                obj = extract_json_obj(text)
-                if not valid_storage_data(obj):
-                    out['ok'] = False
-                    out['error'] = 'invalid storage data in archive'
-                    out['error_code'] = 'archive_invalid_storage'
-                    out['skipped'].append('storage.json（数据结构无效）')
-                    continue
+                valid = valid_storage_data(obj)
+            elif key.startswith('memories/'):
+                valid = isinstance(obj, dict) and isinstance(obj.get('items'), list)
+                if valid:
+                    normalized = [_archive_memory_item(item) for item in obj['items']]
+                    valid = all(item is not None for item in normalized)
+                    if valid:
+                        obj['items'] = normalized
+            else:
+                valid = (isinstance(obj, dict) and isinstance(obj.get('items'), dict)
+                         and isinstance(obj.get('days', {}), dict))
+            if not valid:
+                out['error_code'] = 'archive_invalid_storage' if key == 'storage.json' else 'archive_invalid_data'
+                raise ValueError('invalid archive data: ' + key)
+            entries.append((key, text, obj))
+        if not entries:
+            raise ValueError('archive has no restorable data')
+    except Exception as e:
+        out.update(ok=False, error='archive validation failed: ' + str(e)[:160])
+        out.setdefault('error_code', 'archive_invalid_data')
+        zf.close()
+        return out
+    try:
+        for key, text, obj in entries:
+            if key == 'storage.json':
                 with STORAGE_LOCK:
                     if not force and read_storage().get('data'):
                         out['storage'] = 'skipped_has_data'
                         continue
-                    stamp = put_storage(obj)
-                    out['storage'] = 'restored' if stamp else 'failed'
+                    if put_storage(obj) is None:
+                        raise OSError('could not restore storage')
+                    out['storage'] = 'restored'
                 continue
-            # memories/xxx.json 与 recall/xxx.json
-            if extract_json_obj(text) is None:
-                out['skipped'].append(key + '（不是合法 JSON）')
-                continue
-            sub = key.split('/', 1)[0]
-            base = os.path.basename(key)
-            target = os.path.join(MEMORY_DIR if sub == 'memories' else RECALL_DIR, base)
-            res = _archive_write(target, text, force)
-            out['memories' if sub == 'memories' else 'recall'].append(
-                {'file': base, 'result': res})
+            sub, name = key.split('/', 1)
+            target = os.path.join(MEMORY_DIR if sub == 'memories' else RECALL_DIR, name)
+            if sub == 'memories':
+                profile = os.path.splitext(name)[0]
+                with MEM_LOCK:
+                    if not force and (os.path.exists(target) or os.path.exists(_profile_memory_file(profile))):
+                        result = 'skipped_exists'
+                    else:
+                        _bump_memory_epoch(profile)
+                        _mem_save_v2(profile, obj, enforce_limit=False)
+                        result = 'restored'
+            else:
+                result = _archive_write(target, text, force)
+            out[sub].append({'file': name, 'result': result})
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
-        out['ok'] = False
-        out['error'] = u'导入中途失败：%s' % str(e)[:120]
-        out['error_code'] = 'archive_import_failed'
+        out.update(ok=False, error='archive import failed: ' + str(e)[:160],
+                   error_code='archive_import_failed')
     finally:
-        try:
-            zf.close()
-        except Exception:
-            pass
+        zf.close()
     out['restored'] = (1 if out.get('storage') == 'restored' else 0) + \
         len([x for x in out['memories'] + out['recall'] if x.get('result') == 'restored'])
     return out
@@ -6655,7 +6713,13 @@ class Handler(BaseHTTPRequestHandler):
         if re.search(r'/api/archive$', path_only):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             pid = (query.get('profile_id') or ['default'])[0]
-            self._send_zip(archive_export(pid), _archive_name())
+            try:
+                data = archive_export(pid)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                self._send_error(500, 'archive export failed; no complete backup was created')
+                return
+            self._send_zip(data, _archive_name())
             return
         if re.search(r'/api/tts/voices$', path_only):
             self._send(200, tts_voices_payload())
@@ -6789,6 +6853,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except Exception:
                 pass
+        finally:
+            close = getattr(events, 'close', None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
 
     def do_OPTIONS(self):
         if not self._origin_allowed():

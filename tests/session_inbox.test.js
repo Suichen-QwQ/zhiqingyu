@@ -5,4 +5,7 @@ const ctx={DB,pendingQueue:[],typingVis:()=>false,dbSave:()=>save++,uid:()=> 'qu
 vm.createContext(ctx);vm.runInContext(html.slice(qStart,qEnd)+html.slice(start,end)+'\nthis.inbox=inboxSend;this.flush=flushQueue',ctx);
 (async()=>{ctx.inbox('a','late inbox');finish({ok:false,json:async()=>({error_code:'no_active_turn'})});await new Promise(setImmediate);
  assert.equal(a.msgs[0].text,'late inbox');assert.equal(b.msgs.length,0);assert.equal(sent.length,0);assert(a.msgs[0].failed);DB.activeId='a';ctx.flush();assert.equal(sent[0].id,a.msgs[0].id);assert.equal(a.msgs.length,1);assert(!a.msgs[0].queued);assert(save);console.log('delayed inbox fallback stays in its original session passed');
+ a.msgs=[];DB.activeId='b';ctx.inbox('a','acknowledged supplement');assert.equal(a.msgs[0].text,'acknowledged supplement');
+ finish({ok:true,json:async()=>({queued:true})});await new Promise(setImmediate);assert.equal(a.msgs.length,1);assert(!a.msgs[0].queued);assert(!a.msgs[0].failed);
+ console.log('inbox supplements persist before acknowledgement and remain in original session passed');
 })().catch(e=>{console.error(e);process.exitCode=1});
