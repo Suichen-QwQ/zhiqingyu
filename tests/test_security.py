@@ -346,6 +346,50 @@ class SecurityTests(unittest.TestCase):
             with self.assertRaises(server.LLMError):
                 list(server._iter_resp_lines(Response(gzip.compress(b'line\n'*100))))
 
+    def test_memory_merge_preserves_live_metadata_and_id_conflicts(self):
+        from unittest.mock import patch
+        with patch.object(server, 'MEMORY_V2', True):
+            pid = 'atomic-merge-v2'
+            server.replace_profile_memory(pid, [{'id': 'same-id', 'text': 'live fact', 'imp': 5, 'pinned': True}])
+            self.assertTrue(server.merge_profile_memory(pid, [
+                {'id': 'same-id', 'text': 'different imported fact', 'imp': 4},
+                {'id': 'duplicate', 'text': 'live fact', 'imp': 1},
+            ]))
+            items = server._mem_load_v2(pid)['items']
+            self.assertEqual(len(items), 2)
+            self.assertEqual(len({item['id'] for item in items}), 2)
+            live = next(item for item in items if item['text'] == 'live fact')
+            self.assertEqual(live['imp'], 5)
+            self.assertTrue(live['pinned'])
+
+    def test_parallel_memory_merges_preserve_all_facts(self):
+        from unittest.mock import patch
+        from concurrent.futures import ThreadPoolExecutor
+        with patch.object(server, 'MEMORY_V2', True):
+            pid = 'parallel-merge'
+            server.replace_profile_memory(pid, [{'text': 'initial fact'}])
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                result = list(pool.map(lambda i: server.merge_profile_memory(pid, [{'text': 'unique fact %s' % i}]), range(12)))
+            self.assertTrue(all(result))
+            self.assertEqual(len(server._mem_load_v2(pid)['items']), 13)
+
+    def test_legacy_memory_accepts_structured_backups_without_dict_stringification(self):
+        from unittest.mock import patch
+        with patch.object(server, 'MEMORY_V2', False):
+            pid = 'legacy-merge'
+            server.replace_profile_memory(pid, ['2026-10-31 10:00 initial fact'])
+            self.assertTrue(server.merge_profile_memory(pid, [{'text': 'imported fact'}]))
+            facts = [server._split_mem_item(item)[1] for item in server.profile_memory_items(pid)]
+            self.assertEqual(set(facts), {'initial fact', 'imported fact'})
+            self.assertTrue(server.replace_profile_memory(pid, [{'text': 'replacement fact'}]))
+            self.assertEqual(server._split_mem_item(server.profile_memory_items(pid)[0])[1], 'replacement fact')
+
+    def test_non_object_json_returns_400(self):
+        for payload in ('[]', 'null', '42', '"string"'):
+            for path in ('/api/answer', '/api/inbox', '/api/settings', '/api/chat'):
+                status, _, _ = self.request('POST', path, payload.encode(), {'Content-Type': 'application/json'})
+                self.assertEqual(status, 400)
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

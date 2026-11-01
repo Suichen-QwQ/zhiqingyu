@@ -882,7 +882,13 @@ def replace_profile_memory(profile_id, items, hints=None):
         except Exception as e:
             sys.stderr.write('[memory] replace v2 failed: %s\n' % str(e)[:160])
             return False
-    clean = [str(item).strip() for item in raw_items if str(item).strip()]
+    clean = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            normalized = _mem_norm_item(item)
+            clean.extend(_mem_items_to_lines([normalized]) if normalized else [])
+        elif str(item).strip():
+            clean.append(str(item).strip())
     try:
         with MEM_LOCK:
             path = _profile_memory_file(profile_id)
@@ -2726,18 +2732,49 @@ def _split_mem_item(item):
     return '', it
 
 
+def merge_profile_memory(profile_id, raw_items):
+    """Merge imported facts under the same lock as live updates."""
+    if not isinstance(raw_items, list):
+        raise ValueError('memory items must be an array')
+    with MEM_LOCK:
+        if MEMORY_V2:
+            data = _mem_load_v2(profile_id)
+            items = list(data.get('items') or [])
+            texts = set(_mem_norm_text(item.get('text') or '') for item in items)
+            ids = set(item.get('id') for item in items)
+            for raw in raw_items:
+                item = _mem_norm_item(raw)
+                if not item:
+                    continue
+                text = _mem_norm_text(item['text'])
+                if text in texts:
+                    continue
+                if item['id'] in ids:
+                    item['id'] = _mem_new_id()
+                items.append(item)
+                texts.add(text)
+                ids.add(item['id'])
+            data['items'] = items
+            _mem_save_v2(profile_id, data)
+            return True
+        items = profile_memory_items(profile_id)
+        texts = set(_mem_norm_text(_split_mem_item(line)[1]) for line in items)
+        for raw in raw_items:
+            if isinstance(raw, dict):
+                item = _mem_norm_item(raw)
+                lines = _mem_items_to_lines([item]) if item else []
+            else:
+                lines = [str(raw or '').strip()]
+            for line in lines:
+                text = _mem_norm_text(_split_mem_item(line)[1])
+                if text and text not in texts:
+                    items.append(line)
+                    texts.add(text)
+        return replace_profile_memory(profile_id, items)
+
+
 def restore_profile_memory(profile_id, lines):
-    """把若干条原始记忆行（含时间戳前缀）原样插回 —— 撤销 AI 的删除用。"""
-    items = profile_memory_items(profile_id)
-    added = 0
-    for line in (lines or []):
-        s = str(line).strip()
-        if s and s not in items:
-            items.append(s)
-            added += 1
-    if not added:
-        return True
-    return replace_profile_memory(profile_id, items)
+    return merge_profile_memory(profile_id, lines or [])
 
 
 def manage_memory(profile_id, message):
@@ -6319,6 +6356,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send_error(400, 'invalid JSON')
             return
+        if not isinstance(payload, dict):
+            self._send_error(400, 'JSON body must be an object')
+            return
         # 提问卡片的回答：命中正在等待的 ask_id → 生成线程立刻续写；过期/取消回 409。
         if re.search(r'/api/answer', self.path):
             _aid = str(payload.get('ask_id') or payload.get('id') or '')
@@ -6404,6 +6444,9 @@ class Handler(BaseHTTPRequestHandler):
                     items = payload.get('items') or []
                     self._send(200, {'ok': restore_profile_memory(profile_id, items),
                                      'count': len(items)})
+                elif action == 'merge':
+                    items = payload.get('items') or []
+                    self._send(200, {'ok': merge_profile_memory(profile_id, items), 'count': len(items)})
                 elif action == 'replace':
                     items = payload.get('items') or []
                     self._send(200, {'ok': replace_profile_memory(profile_id, items),

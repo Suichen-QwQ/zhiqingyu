@@ -302,7 +302,7 @@ GET 还没回来（323KB 云端包 + 公网 RTT 很容易超过 1300ms），空�
   - `items_v2` 仅 `ZQY_MEMORY_V2=1` 时返回；关闭时**不读也不算**，避免只读请求顺手落盘。
   - `stats = {total, pinned, dropped_last, dropped_count}`
 - `POST /api/memory` 的 `action`：`clear` / `delete` / `add` / `update` / `pin` /
-  `search` / `restore` / `replace` / `migrate`
+  `search` / `restore` / `merge` / `replace` / `migrate`
 
 ### 存储整包（会话 + 日记 + 元信息）
 
@@ -416,3 +416,5 @@ GET 还没回来（323KB 云端包 + 公网 RTT 很容易超过 1300ms），空�
 - 生效服务地址为 `https://api.deepseek.com` 或其 `/v1` 路径时，所有 `web_search` 执行走官方 `POST https://api.deepseek.com/v1/tools/search`，复用服务端保存的 Key。请求体为 `{query, count, need_content:false}`，将 `results` 归一为现有 `sources`，无需修改 SSE 或聊天返回字段。
 - 官方搜索不可用时沿用 `search_status:empty` 提示，不改用其他搜索商；其他网关保留现有千帆/Tavily/Bing 路径。缓存按搜索商、账号和数量隔离。
 - 参考：[DeepSeek 官方 Search API](https://api-docs.deepseek.com/api/search/)。本接入直接使用官方搜索服务，适用于当前的 Chat Completions 工具循环。
+
+记忆 `merge` 动作在服务端加锁合并字符串或结构化条目，保留现有条目和元数据；`replace` 则显式覆盖整表。前端与后端应一同更新。

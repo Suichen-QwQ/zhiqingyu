@@ -3726,7 +3726,7 @@
     return out;
   }
   async function askYu(text,id,avoid){
-    const requestSession=curSess(), requestMessages=requestSession.msgs;
+    const requestSession=curSess();
     typingEl.querySelector('.typing-label').textContent='正在回应';
     typingEl.style.display='inline-flex';
     /* 「深度思考中」提示动画已按用户要求移除；thinkEl 保留仅作消息插入锚点 */
@@ -3734,11 +3734,11 @@
     /* emote 必带：后端要反查「你最近配过哪几张图」，模型才能主动换一张。
        不带的话模型对自己上一轮发了什么图零感知，会反复挑同一个熟词
        （实测跨会话反复出现同一张）。后端 recent_emote_note() 消费它。 */
-    const hist=requestMessages.filter(m=>m.id!==id&&!m.failed).slice(-20).map(m=>({role:m.role,text:m.text,ts:m.ts,emo:m.emo,theme:m.theme,emote:m.emote}));
+    const hist=requestSession.msgs.filter(m=>m.id!==id&&!m.failed).slice(-20).map(m=>({role:m.role,text:m.text,ts:m.ts,emo:m.emo,theme:m.theme,emote:m.emote}));
     /* P7 会话摘要记账：摘要只折「已经滑出逐字窗口」的消息——窗口内那 20 条本来就会原样进
        prompt，再抄进摘要就是纯重复（老实现每轮都重复一遍）。covered_upto 记着上一轮折到哪条。 */
     const _sm=(requestSession.summary_meta&&typeof requestSession.summary_meta==='object')?requestSession.summary_meta:{};
-    const _base=requestMessages.filter(x=>x.id!==id&&!x.failed);
+    const _base=requestSession.msgs.filter(x=>x.id!==id&&!x.failed);
     const _win=Math.max(0,_base.length-20);   /* 逐字窗口起点，与 hist 的 slice(-20) 同口径 */
     let _start=0;
     const _ci=_sm.covered_upto?_base.findIndex(x=>x.id===_sm.covered_upto):-1;
@@ -3761,7 +3761,7 @@
     /* 墙钟兜底也要留下来源：它不是用户点的停止，不能和「已停止生成」混为一谈。 */
     const tmr=setTimeout(()=>{ req.timedOut=true; ctrl.abort(); },limit);
     const withTide=Math.random()>0.4;
-    const m={id:uid(),role:'ai',text:'',ts:Date.now(),emo:'平静',theme:'',tide:withTide,partnerName:payload.persona.name||''};
+    const m={id:uid(),role:'ai',replyTo:id,text:'',ts:Date.now(),emo:'平静',theme:'',tide:withTide,partnerName:payload.persona.name||''};
     req.partialMessage=m;req.sourceSession=requestSession;
     let el=null, done=null, errData=null, completed=false;
     /* 用同一个等待提示显示思考或搜索状态，正文开始后立即收起。 */
@@ -3850,8 +3850,8 @@
         if(m.text){
           /* 半截正文会留在历史里，那就把这次的风险卡一起存下来，重开页面还能看到求助资源 */
           if(badRisk) m.risk=badRisk;
-          requestMessages.push(m);
-          const s0=requestMessages.find(x=>x.id===id);
+          requestSession.msgs.push(m);
+          const s0=requestSession.msgs.find(x=>x.id===id);
           if(s0){ s0.failed=false; s0.emo=m.emo; s0.theme=m.theme; }
           dbSave();
         }else if(el){ el.remove(); el=null; }
@@ -3877,7 +3877,7 @@
       enterMessageParts(finalEl,previous);
       if(follow)followMessageGrowth(finalEl);
       el=finalEl;
-      requestMessages.push(m); const src=requestMessages.find(x=>x.id===id);
+      requestSession.msgs.push(m); const src=requestSession.msgs.find(x=>x.id===id);
       if(src){ src.failed=false; src.emo=m.emo; src.theme=m.theme; src.emote=m.emote; }
       requestSession.summary=done.summary||requestSession.summary||'';
       if(done.summary_meta&&typeof done.summary_meta==='object') requestSession.summary_meta=done.summary_meta;
@@ -3890,12 +3890,12 @@
       const aborted=(err&&err.name==='AbortError');
       if(req.stopped){
         /* 1) 用户主动点的停止：保留已生成的半截正文，如实提示 */
-        if(m.text){ if(!req.partialSaved){requestMessages.push(m);dbSave();} } else if(el){ el.remove(); }
+        if(m.text){ if(!req.partialSaved){requestSession.msgs.push(m);dbSave();} } else if(el){ el.remove(); }
         if(!req.sessionChanged)showToast('已停止生成');
       } else if(aborted){
         /* 2)/3) 墙钟兜底或连接断流：不是用户停的，绝不能显示「已停止生成」，
            否则用户以为是自己停的，也就不会去点重试。保留半截正文 + 可重试提示。 */
-        if(m.text){ requestMessages.push(m); dbSave(); } else if(el){ el.remove(); el=null; }
+        if(m.text){ requestSession.msgs.push(m); dbSave(); } else if(el){ el.remove(); el=null; }
         showErrBubble(id, req.timedOut
           ? '这次等太久了，我先停下来了，点重试再来一次'
           : '连接中途断了，点重试再来一次', '', null);
@@ -4102,11 +4102,16 @@
   }
   /* 删一条 me 消息时，把它引出的那条 ai 回复一起删——只留半截对话更让人困惑 */
   function delMsg(id){
+    if(window.zqyCancelChat)window.zqyCancelChat(DB.activeId);
     const i=DB.msgs.findIndex(x=>x.id===id);
     if(i<0) return;
     const m=DB.msgs[i];
     const rm=[id];
-    if(m.role==='me'&&DB.msgs[i+1]&&DB.msgs[i+1].role==='ai') rm.push(DB.msgs[i+1].id);
+    if(m.role==='me'){
+      DB.msgs.forEach(x=>{if(x.role==='ai'&&x.replyTo===id)rm.push(x.id);});
+      const next=DB.msgs[i+1];
+      if(next&&next.role==='ai'&&!next.replyTo)rm.push(next.id);
+    }
     DB.msgs=DB.msgs.filter(x=>!rm.includes(x.id));
     dbSave();
     renderMsgs(); renderLive(); renderCal(); refreshStats();
@@ -4127,8 +4132,8 @@
       else {
         /* 换个说法：删掉这条 ai 回复，用它上一条 me 消息重新问一遍，并避开刚才那句 */
         const i=DB.msgs.findIndex(x=>x.id===m.id);
-        let src=null;
-        for(let j=i-1;j>=0;j--){ if(DB.msgs[j].role==='me'){ src=DB.msgs[j]; break; } }
+        let src=m.replyTo?DB.msgs.find(x=>x.id===m.replyTo&&x.role==='me'):null;
+        if(!src)for(let j=i-1;j>=0;j--){ if(DB.msgs[j].role==='me'){ src=DB.msgs[j]; break; } }
         if(!src){ showToast('找不到对应的那句话'); return; }
         const prev=m.text;
         DB.msgs=DB.msgs.filter(x=>x.id!==m.id);
@@ -4843,22 +4848,7 @@
       const legacy=(Array.isArray(backup&&backup.memory)?backup.memory:[])
         .filter(function(s){ return typeof s==='string'&&s.trim(); });
       if(!v2.length&&!legacy.length) return true;
-      let curItems=[],curV2=[],liveV2=false;
-      try{
-        const d=await fetch('api/memory?profile_id='+encodeURIComponent(profileId())).then(function(r){ return r.json(); });
-        curItems=Array.isArray(d&&d.items)?d.items:[];
-        if(Array.isArray(d&&d.items_v2)){ liveV2=true; curV2=d.items_v2; }
-      }catch(e){}
-      let payload;
-      if(v2.length){
-        /* 活的后端支持 v2 → 直接写对象；否则转回「日期 时间 + 事实」字符串（旧后端格式） */
-        payload=liveV2
-          ?(overwrite?v2:curV2.concat(v2))
-          :(overwrite?v2.map(memObjToString):curItems.concat(v2.map(memObjToString)));
-      }else{
-        payload=overwrite?legacy:curItems.concat(legacy);
-      }
-      return !!(await memPost({action:'replace',items:payload})).ok;
+      return !!(await memPost({action:overwrite?'replace':'merge',items:v2.length?v2:legacy})).ok;
     }
 
     /* ---- 对话展示开关：隐藏思考过程 / 隐藏联网来源（存 meta.flags，独立两项） ---- */
@@ -5973,6 +5963,11 @@
   }
   /* 让屿把某天的对话写成日记（LLM 生成 narrative） */
   const diaryGenerating=new Set();
+  function diarySourceTexts(k){
+    return (DB.sessions||[]).flatMap(s=>s.msgs||[])
+      .filter(m=>m&&m.ts&&m.role&&m.text&&!m.failed&&tsKey(m.ts)===k)
+      .sort((a,b)=>a.ts-b.ts).slice(-40).map(m=>({role:m.role,text:m.text.slice(0,200)}));
+  }
   async function genDiary(k){
     if(diaryGenerating.has(k)) return;
     const before=String((DB.diary[k]&&DB.diary[k].narrative)||'');
@@ -5983,12 +5978,7 @@
     diaryGenerating.add(k);
     const btns=[].slice.call(document.querySelectorAll('.gen-btn[data-k="'+k+'"]'));
     btns.forEach(b=>{ b.disabled=true; b.textContent='正在写'; b.classList.add('busy'); });   /* 加载动画占位 */
-    const texts=[];
-    (DB.sessions||[]).forEach(s=>(s.msgs||[]).forEach(m=>{
-      if(m&&m.ts&&m.role&&m.text&&!m.failed&&tsKey(m.ts)===k){
-        texts.push({role:m.role,text:m.text.slice(0,200)});
-      }
-    }));
+    const sourceDiary=DB.diary, texts=diarySourceTexts(k), sourceSignature=JSON.stringify(texts);
     if(texts.length<2){
       btns.forEach(b=>{ b.disabled=false; b.textContent='让'+partnerName()+'写下来'; b.classList.remove('busy'); });
       showToast('这一天聊得还不多，先和'+partnerName()+'多说几句吧');
@@ -6000,6 +5990,10 @@
         body:JSON.stringify({action:'gen',texts:texts.slice(-40)})});
       const d=await r.json();
       if(!d||!d.narrative) throw 0;
+      if(DB.diary!==sourceDiary||JSON.stringify(diarySourceTexts(k))!==sourceSignature){
+        btns.forEach(b=>{b.disabled=false;b.classList.remove('busy');b.textContent='重新生成';});
+        showToast('数据或对话已变化，未写入旧日记');return;
+      }
       const dd=ensureDay(k);
       const editing=document.querySelector('.d-card[data-k="'+k+'"] p.narr[data-editing]');
       if(editing || String(dd.narrative||'')!==before){
@@ -6291,6 +6285,7 @@
   }
   function startEdit(p,k){
     if(p.dataset.editing) return;
+    const editDiary=DB.diary;
     p.dataset.editing='1';
     const card=p.closest('.d-card');
     card.classList.add('open');            /* 编辑时先展开，免得写着看不见 */
@@ -6306,6 +6301,7 @@
       p.classList.remove('editing');
       delete p.dataset.editing;
       const txt=p.textContent.trim();
+      if(DB.diary!==editDiary)return;
       const d=ensureDay(k);
       d.narrative=txt;
       dbSave();

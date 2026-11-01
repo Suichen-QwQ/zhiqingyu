@@ -16,4 +16,9 @@ const ctx={DB,activeRequest:null,window:{},curSess:()=>DB.sessions.find(s=>s.id=
 vm.createContext(ctx);vm.runInContext(html.slice(cancelStart,cancelEnd)+html.slice(start,end)+'\nthis.run=askYu',ctx);
 (async()=>{const task=ctx.run('hi','question');await new Promise(setImmediate);DB.activeId='b';ctx.window.zqyCancelChat();const newer={sessionId:'b'};ctx.activeRequest=newer;ctx.typingEl.style.display='new-request';await task;
  assert.equal(a.msgs[1].text,'partial');assert.equal(b.msgs.length,0);assert.equal(ctx.activeRequest,newer);assert.equal(ctx.typingEl.style.display,'new-request');assert(saved);console.log('session switch preserves original partial reply and newer request state passed');
+ a.msgs=[a.msgs[0]];DB.activeId='a';readCount=0;ctx.activeRequest=null;
+ const second=ctx.run('hi','question');await new Promise(setImmediate);
+ const detached=a.msgs;a.msgs=a.msgs.slice();ctx.activeRequest.stopped=true;ctx.activeRequest.ctrl.abort();await second;
+ assert.equal(a.msgs.length,2);assert.equal(a.msgs[1].text,'partial');assert.equal(detached.length,1);
+ console.log('partial reply uses the current message buffer after array replacement passed');
 })().catch(e=>{console.error(e);process.exitCode=1});
