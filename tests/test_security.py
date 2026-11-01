@@ -941,6 +941,96 @@ class SecurityTests(unittest.TestCase):
                     self.assertTrue(server.delete_profile_memory_v2(pid, item_id='extra'))
                     self.assertEqual(len(server.memory_snapshot(pid)['items_v2']), len(facts))
 
+    def test_corrupt_recall_never_becomes_an_empty_writable_store(self):
+        from unittest.mock import patch
+        pid = 'corrupt-recall'
+        path = Path(server._recall_path(pid))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for raw in (b'{broken', b'[]', b'{"items":[]}', b'{"items":{"weekly":{"x":42}}}',
+                    b'{"items":{},"days":{"bad-date":{}}}'):
+            path.write_bytes(raw)
+            for query in ('', '&missing=1'):
+                status, _, body = self.request('GET', '/api/recall?profile_id=' + pid + query)
+                self.assertEqual(status, 503)
+                self.assertEqual(json.loads(body)['error_code'], 'recall_unreadable')
+            payload = json.dumps({'action': 'build', 'profile_id': pid,
+                                  'days': [{'date': '2026-10-01', 'text': 'new diary'}]}).encode()
+            with patch.object(server, 'call_recall_gen', side_effect=AssertionError('unexpected model call')):
+                self.assertEqual(self.request('POST', '/api/recall', payload, {'Content-Type': 'application/json'})[0], 503)
+            self.assertEqual(path.read_bytes(), raw)
+
+    def test_recall_clear_reports_delete_failure(self):
+        from unittest.mock import patch
+        pid = 'recall-clear-failure'
+        path = Path(server._recall_path(pid))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = b'{"items":{},"days":{}}'
+        path.write_bytes(raw)
+        payload = json.dumps({'action': 'clear', 'profile_id': pid}).encode()
+        with patch.object(server.os, 'remove', side_effect=PermissionError('locked file')):
+            status, _, body = self.request('POST', '/api/recall', payload, {'Content-Type': 'application/json'})
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)['ok'])
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertTrue(server.clear_recall(pid))
+        self.assertTrue(server.clear_recall(pid))
+
+    def test_recall_save_failure_keeps_original_and_cleans_temporary_file(self):
+        from unittest.mock import patch
+        pid = 'recall-save-failure'
+        server._recall_save(pid, {'items': {}, 'days': {}})
+        path = Path(server._recall_path(pid))
+        original = path.read_bytes()
+        with patch.object(server.os, 'replace', side_effect=PermissionError('locked original')):
+            with self.assertRaises(PermissionError):
+                server._recall_save(pid, {'items': {}, 'days': {'2026-10-01': {'t': 'new diary'}}})
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(path.parent.glob('.zqy-recall-*.tmp')), [])
+
+    def test_archive_recall_repair_preserves_corrupt_original(self):
+        import io
+        import zipfile
+        pid = 'repair-recall'
+        path = Path(server._recall_path(pid))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = b'{broken recall'
+        path.write_bytes(original)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('recall/' + pid + '.json', json.dumps({'items': {}, 'days': {'2026-10-01': {'t': 'restored diary'}}}))
+        result = server.archive_import(archive.getvalue(), False)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error_code'], 'recall_unreadable')
+        self.assertEqual(path.read_bytes(), original)
+        self.assertTrue(server.archive_import(archive.getvalue(), True)['ok'])
+        self.assertEqual(server._recall_load(pid)['days']['2026-10-01']['t'], 'restored diary')
+        self.assertTrue(any(p.read_bytes() == original for p in path.parent.glob('.zqy-recall-corrupt-*.bak')))
+
+    def test_invalid_recall_archive_is_rejected_before_storage_changes(self):
+        import io
+        import zipfile
+        revision = server.read_storage()['revision']
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('storage.json', json.dumps({'sessions': [{'msgs': ['replacement']}]}))
+            zf.writestr('recall/bad-recall.json', json.dumps({'items': {'weekly': {'x': []}}}))
+        self.assertFalse(server.archive_import(archive.getvalue(), True)['ok'])
+        self.assertEqual(server.read_storage()['revision'], revision)
+
+    def test_recall_build_and_snapshot_still_round_trip(self):
+        from unittest.mock import patch
+        pid = 'recall-normal-roundtrip'
+        days = [{'date': '2026-10-01', 'text': 'a meaningful day ' * 30}]
+        with patch.object(server, 'call_recall_gen', return_value='generated summary'):
+            result = server.build_recall(pid, days, max_calls=1, months=60)
+        self.assertTrue(result['ok'])
+        self.assertEqual(len(result['generated']), 1)
+        snapshot = server.recall_snapshot(pid, months=60, ref_date='2026-11-01')
+        self.assertTrue(snapshot['ok'])
+        self.assertIn('generated summary', snapshot['shared'])
+        self.assertEqual(snapshot['days'], 1)
+        self.assertTrue(server.recall_missing(pid, months=60, ref_date='2026-11-01')['ok'])
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

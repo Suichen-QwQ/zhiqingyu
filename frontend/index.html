@@ -5450,7 +5450,7 @@
           const response=await fetch('api/archive?action=import'+(overwrite?'&force=1':'')+'&profile_id='+encodeURIComponent(importProfile),
             {method:'POST',headers:{'Content-Type':'application/zip'},body:buf});
           const data=await response.json();restored=!!(data&&data.storage==='restored');
-          if(!overwrite&&data&&['storage_unreadable','memory_unreadable'].includes(data.error_code)){
+          if(!overwrite&&data&&['storage_unreadable','memory_unreadable','recall_unreadable'].includes(data.error_code)){
             const repair=await zqyConfirm({title:'云端数据无法读取',body:'是否用这份归档覆盖并修复？归档中对应的对话、记忆和回忆会被替换；服务端会先保留损坏文件副本。',ok:'用归档修复',cancel:'保留原文件',danger:true});
             if(repair){overwrite=true;continue;}
           }
@@ -7463,6 +7463,9 @@
 
   /* ---- DOM 区：加载 / 渲染 / 事件 ---- */
   let rcBusy=false, rcData=null, rcLast=null;
+  let rcLoadSeq=0,rcMissingSeq=0,rcDataContext=null;
+  function rcContext(){return {profile:profileId(),months:rcMonthsValue()};}
+  function rcContextMatches(context){return !!context&&context.profile===profileId()&&context.months===rcMonthsValue();}
   function rcEl(id){ return document.getElementById(id); }
   function rcMonthsValue(){
     DB.meta=(DB.meta&&typeof DB.meta==='object')?DB.meta:{};
@@ -7570,25 +7573,27 @@
   async function loadRecall(){
     /* 首屏若直接停在 #/recall，applyRoute 会在本模块初始化之前调用 go('recall')；
        此时模块内的 let/const 还在 TDZ，先按 ready 标记跳过，初始化完再补一次加载 */
-    if(!window.zqyRecallReady) return;
+    if(!window.zqyRecallReady) return false;
+    const context=rcContext(),seq=++rcLoadSeq;rcMissingSeq++;
+    if(!rcContextMatches(rcDataContext)){rcData=null;rcLast=null;rcPaintAll();}
+    rcPaintMissing(null);
     const st=rcEl('rcStatus');
     if(!rcData&&st){ st.hidden=false; st.textContent='正在读取回忆…'; }
     let data=null;
     try{
-      const r=await fetch('api/recall?profile_id='+encodeURIComponent(profileId())+'&months='+rcMonthsValue());
-      try{ data=await r.json(); }catch(e){ data=null; }
-    }catch(e){ data=null; }
+      const r=await fetch('api/recall?profile_id='+encodeURIComponent(context.profile)+'&months='+context.months);
+      if(r.ok)data=await r.json();
+    }catch(e){}
+    if(seq!==rcLoadSeq||!rcContextMatches(context))return false;
     if(!data||data.ok!==true){
       if(st){ st.hidden=false; st.textContent='暂时读不到回忆'; }
       const pd=rcEl('rcPending'); if(pd){ pd.hidden=true; pd.textContent=''; }
       showToast('读不到回忆，等会儿再试');
-      rcPaintButtons();
-      return;
+      rcPaintButtons();return false;
     }
-    rcData=data;
-    rcData.months=data.months||rcMonthsValue();
-    rcPaintAll();
-    loadRecallMissing();
+    rcData=data;rcDataContext=context;
+    rcData.months=data.months||context.months;
+    rcPaintAll();loadRecallMissing();return true;
   }
   /* ==== 缺失摘要检测（P2-3）：哪些周期「日记已经攒够、却还没整理成回忆」 ====
      后端只报「未结束的周期不算缺」「材料不够不算缺」，与 build_recall 同一套判定，
@@ -7610,29 +7615,32 @@
   }
   async function loadRecallMissing(){
     const box=rcEl('rcMissing'); if(!box) return;
-    let d=null;
+    const context=rcContext(),seq=++rcMissingSeq;
+    let data=null;
     try{
-      const r=await fetch('api/recall?missing=1&profile_id='+encodeURIComponent(profileId())
-        +'&months='+rcMonthsValue());
-      try{ d=await r.json(); }catch(e){ d=null; }
-    }catch(e){ d=null; }
-    if(!d){ box.hidden=true; rcMissingList=[]; return; }   /* 读不到就不打扰 */
-    rcPaintMissing(d);
+      const r=await fetch('api/recall?missing=1&profile_id='+encodeURIComponent(context.profile)+'&months='+context.months);
+      if(r.ok)data=await r.json();
+    }catch(e){}
+    if(seq!==rcMissingSeq||!rcContextMatches(context))return;
+    if(!data){box.hidden=true;rcMissingList=[];return;}
+    rcPaintMissing(data);
   }
   /* 单轮 POST build（网络失败 / 服务端关闭都不抛，交回调用方按 ok 分支） */
-  async function rcPostBuild(rows,months){
-    const body=rcBuildBody(profileId(),rows,months);
+  async function rcPostBuild(rows,months,targetProfile=profileId()){
+    const context={profile:targetProfile,months:months};
+    const body=rcBuildBody(targetProfile,rows,months);
     let r=null,data=null;
     try{
       r=await fetch('api/recall',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify(body)});
       try{ data=await r.json(); }catch(e){ data=null; }
     }catch(e){ data=null; r=null; }
+    if(!rcContextMatches(context))return {ok:false,canceled:true};
     if(!data){
       showToast('网络不太好，整理没成功');
       return {ok:false,error:'network'};
     }
-    if((r&&r.status===503)||data.error_code==='recall_off'){
+    if(data.error_code==='recall_off'){
       rcData=rcData||{};
       rcData.enabled=false;
       rcPaintButtons();
@@ -7647,9 +7655,11 @@
   }
   async function rcBuildNow(){
     if(rcBusy) return;
-    const rows=rcDaysFromDiary(DB.diary);
+    const sourceDiary=DB.diary,context=rcContext();
+    const rows=rcDaysFromDiary(sourceDiary);
     if(!rows.length){ showToast('还没有能整理的日记'); return; }
-    const months=rcMonthsValue();
+    const months=context.months;
+    const current=()=>rcContextMatches(context)&&DB.diary===sourceDiary;
     rcBusy=true; rcLast=null;
     rcPaintButtons(); rcPaintDetail();
     const st=rcEl('rcStatus');
@@ -7658,8 +7668,9 @@
     try{
       batch=await rcRunBatch({
         maxAuto:3,
-        build:function(){ return rcPostBuild(rows,months); },
+        build:function(){ return current()?rcPostBuild(rows,months,context.profile):Promise.resolve({ok:false,canceled:true}); },
         paint:function(s){
+          if(!current())return;
           const box=rcEl('rcStatus');
           if(!box) return;
           const p=parseInt(s.res&&s.res.pending,10)||0;
@@ -7669,35 +7680,40 @@
       });
     }catch(e){ batch={ok:false,error:String((e&&e.message)||e||'err')}; }
     rcBusy=false;
+    if(!current()){await loadRecall();return;}
     if(!batch||!batch.ok){ await loadRecall(); return; }
+    const loaded=await loadRecall();
+    if(!current()||loaded===false)return;
     rcLast={generated:batch.generated,skipped:batch.skipped,failed:batch.failed,rounds:batch.rounds};
-    await loadRecall();
     rcPaintDetail();
     showToast(batch.generated?('整理好了 '+batch.generated+' 段回忆'):'这次没有新东西需要整理');
   }
   async function rcClear(){
     if(rcBusy) return;
+    const targetProfile=profileId();
     rcBusy=true; rcPaintButtons();
     let out=null;
     try{
       out=await rcClearFlow({
-        confirm:function(){
-          return zqyConfirm({title:'清空共同回忆？',
+        confirm:async function(){
+          const yes=await zqyConfirm({title:'清空共同回忆？',
             body:'年鉴、季报、月报、周报都会被删掉；日记和对话记录都还在。',danger:true});
+          return yes&&targetProfile===profileId();
         },
         post:function(){
           return fetch('api/recall',{method:'POST',headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({action:'clear',profile_id:profileId()})})
-            .then(function(r){ return r.json(); });
+            body:JSON.stringify({action:'clear',profile_id:targetProfile})})
+            .then(function(r){ return r.ok?r.json():{ok:false}; });
         },
         toast:showToast,
-        done:function(){ rcLast=null; }
+        done:function(){ if(targetProfile===profileId())rcLast=null; }
       });
     }catch(e){ out={ok:false,canceled:false}; }
     rcBusy=false;
     if(out&&out.ok) await loadRecall(); else rcPaintButtons();
   }
   async function rcCopyShared(){
+    if(!rcContextMatches(rcDataContext)){showToast('身份或时间范围已变化，请刷新回忆');return;}
     const text=String((rcData&&rcData.shared)||'');
     if(!text){ showToast('还没有可以复制的回忆'); return; }
     const ok=await rcCopyText(text,null);

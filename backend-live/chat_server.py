@@ -1128,10 +1128,10 @@ def _mem_read_json(profile_id):
         raise MemoryReadError('Saved structured memory is unreadable; restore from an archive') from e
 
 
-def _backup_corrupt_memory(path):
+def _backup_corrupt_file(path, prefix):
     import tempfile
     import shutil
-    fd, backup = tempfile.mkstemp(prefix='.zqy-memory-corrupt-', suffix='.bak',
+    fd, backup = tempfile.mkstemp(prefix=prefix, suffix='.bak',
                                    dir=os.path.dirname(os.path.abspath(path)))
     with os.fdopen(fd, 'wb') as dest, open(path, 'rb') as source:
         shutil.copyfileobj(source, dest)
@@ -1189,14 +1189,14 @@ def _mem_save_v2(profile_id, data, migrate=False, enforce_limit=True, repair=Fal
         except MemoryReadError:
             if not repair:
                 raise
-            _backup_corrupt_memory(_mem_json_path(profile_id))
+            _backup_corrupt_file(_mem_json_path(profile_id), '.zqy-memory-corrupt-')
             old = None
         try:
             _mem_read_md(profile_id)
         except MemoryReadError:
             if not repair:
                 raise
-            _backup_corrupt_memory(_profile_memory_file(profile_id))
+            _backup_corrupt_file(_profile_memory_file(profile_id), '.zqy-memory-corrupt-')
         if dropped_items:
             # 落进 json，供 /api/status 报「被淘汰过什么」。只留最近一次的摘要，避免体积膨胀。
             payload['dropped'] = {
@@ -5300,6 +5300,10 @@ _RECALL_HINT = {'weekly': u'把这一周的日子收成一段回忆（120~220 �
 _RECALL_LOCK = threading.RLock()
 
 
+class RecallReadError(Exception):
+    pass
+
+
 def _recall_date(value):
     """'YYYY-MM-DD' / date / datetime → datetime.date；解析失败返回 None。"""
     if isinstance(value, datetime.datetime):
@@ -5364,40 +5368,61 @@ def _recall_path(profile_id):
     return os.path.join(RECALL_DIR, _profile_id(profile_id) + '.json')
 
 
+def _recall_validate(data):
+    if (not isinstance(data, dict) or not isinstance(data.get('items'), dict)
+            or not isinstance(data.get('days', {}), dict)):
+        raise ValueError('recall must contain items and days objects')
+    int(data.get('updated') or 0)
+    for day, value in data.get('days', {}).items():
+        if not _recall_date(day) or not isinstance(value, dict):
+            raise ValueError('invalid recall diary entry')
+        if 't' in value and not isinstance(value['t'], str):
+            raise ValueError('invalid recall diary text')
+    for kind, bucket in data['items'].items():
+        if kind not in _RECALL_TYPES or not isinstance(bucket, dict):
+            raise ValueError('invalid recall period bucket')
+        for item in bucket.values():
+            if not isinstance(item, dict):
+                raise ValueError('invalid recall summary')
+            for field in ('content', 'start', 'end'):
+                if field in item and not isinstance(item[field], str):
+                    raise ValueError('invalid recall summary field')
+            if 'days' in item and not isinstance(item['days'], list):
+                raise ValueError('invalid recall summary days')
+
+
 def _recall_load(profile_id):
-    data = None
     try:
         with open(_recall_path(profile_id), 'r', encoding='utf-8') as f:
             data = json.load(f)
-    except Exception:
-        data = None
-    if not isinstance(data, dict):
-        data = {}
-    items = data.get('items') if isinstance(data.get('items'), dict) else {}
-    out = {'v': 1, 'updated': int(data.get('updated') or 0),
-           'days': data.get('days') if isinstance(data.get('days'), dict) else {},
-           'items': {}}
-    for t in _RECALL_TYPES:
-        bucket = items.get(t)
-        out['items'][t] = bucket if isinstance(bucket, dict) else {}
-    return out
+        _recall_validate(data)
+    except FileNotFoundError:
+        data = {'items': {}, 'days': {}}
+    except Exception as e:
+        raise RecallReadError('Saved recall data are unreadable; restore from an archive') from e
+    return {'v': 1, 'updated': int(data.get('updated') or 0), 'days': data.get('days', {}),
+            'items': dict((kind, data['items'].get(kind, {})) for kind in _RECALL_TYPES)}
 
 
 def _recall_save(profile_id, data):
-    path = _recall_path(profile_id)
-    try:
+    import tempfile
+    with _RECALL_LOCK:
+        _recall_validate(data)
+        _recall_load(profile_id)  # A corrupt original must never be silently replaced.
         os.makedirs(RECALL_DIR, exist_ok=True)
-    except OSError:
-        pass
-    data['v'] = 1
-    data['updated'] = int(time.time())
-    payload = json_dumps({'v': 1, 'updated': data['updated'],
-                          'days': data.get('days') or {},
-                          'items': data.get('items') or {}}, ensure_ascii=False)
-    tmp = '%s.%d.tmp' % (path, int(time.time() * 1000) % 100000)
-    with open(tmp, 'w', encoding='utf-8') as f:
-        f.write(payload)
-    os.replace(tmp, path)
+        data['v'] = 1
+        data['updated'] = int(time.time())
+        payload = json_dumps({'v': 1, 'updated': data['updated'],
+                              'days': data.get('days') or {},
+                              'items': data.get('items') or {}}, ensure_ascii=False)
+        fd, tmp = tempfile.mkstemp(prefix='.zqy-recall-', suffix='.tmp', dir=RECALL_DIR)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(payload)
+            os.replace(tmp, _recall_path(profile_id))
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
 
 def _recall_norm_days(raw):
@@ -5802,13 +5827,13 @@ def recall_missing(profile_id, months=None, ref_date=None):
             'ref': ref.isoformat(), 'count': len(missing), 'missing': missing}
 
 def clear_recall(profile_id):
-    path = _recall_path(profile_id)
     with _RECALL_LOCK:
-        if os.path.isfile(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        try:
+            os.remove(_recall_path(profile_id))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
     return True
 
 
@@ -5902,8 +5927,8 @@ def archive_export(profile_id='default'):
                 raise ValueError('invalid storage data in backup')
             if name.startswith('memories/'):
                 _mem_validate_json(obj)
-            if name.startswith('recall/') and (not isinstance(obj, dict) or not isinstance(obj.get('items'), dict)):
-                raise ValueError('invalid recall data in backup')
+            if name.startswith('recall/'):
+                _recall_validate(obj)
             zf.writestr(strip_lone_surrogates(name), raw)
     finally:
         zf.close()
@@ -6010,8 +6035,8 @@ def archive_import(blob, force=False):
                         obj['items'] = normalized
                         _mem_validate_json(obj)
             else:
-                valid = (isinstance(obj, dict) and isinstance(obj.get('items'), dict)
-                         and isinstance(obj.get('days', {}), dict))
+                _recall_validate(obj)
+                valid = True
             if not valid:
                 out['error_code'] = 'archive_invalid_storage' if key == 'storage.json' else 'archive_invalid_data'
                 raise ValueError('invalid archive data: ' + key)
@@ -6066,7 +6091,15 @@ def archive_import(blob, force=False):
                         _mem_save_v2(profile, obj, enforce_limit=False, repair=force)
                         result = 'restored'
             else:
-                result = _archive_write(target, text, force)
+                with _RECALL_LOCK:
+                    try:
+                        _recall_load(os.path.splitext(name)[0])
+                    except RecallReadError:
+                        if not force:
+                            out['error_code'] = 'recall_unreadable'
+                            raise
+                        _backup_corrupt_file(target, '.zqy-recall-corrupt-')
+                    result = _archive_write(target, text, force)
             out[sub].append({'file': name, 'result': result})
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
@@ -6776,6 +6809,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 result = handle_chat(payload)
                 self._send(200, result)
+        except RecallReadError:
+            self._send(503, {'ok': False, 'error': 'Saved recall data are unreadable; restore from an archive',
+                             'error_code': 'recall_unreadable'})
         except MemoryReadError:
             self._send(503, {'ok': False, 'error': 'Saved memory is unreadable; restore from an archive',
                              'error_code': 'memory_unreadable'})
@@ -6844,12 +6880,16 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             pid = (query.get('profile_id') or ['default'])[0]
             months = (query.get('months') or [None])[0]
-            if (query.get('missing') or ['0'])[0].lower() in ('1', 'true', 'yes', 'on'):
-                # 缺失检测与 build_recall 走同一套「有没有材料 / 有没有总结」判断，
-                # 否则会出现「提示缺、点了整理又跳过」的死循环。
-                self._send(200, recall_missing(pid, months))
-                return
-            self._send(200, recall_snapshot(pid, months))
+            try:
+                if (query.get('missing') or ['0'])[0].lower() in ('1', 'true', 'yes', 'on'):
+                    # 缺失检测与 build_recall 走同一套「有没有材料 / 有没有总结」判断，
+                    # 否则会出现「提示缺、点了整理又跳过」的死循环。
+                    self._send(200, recall_missing(pid, months))
+                else:
+                    self._send(200, recall_snapshot(pid, months))
+            except RecallReadError:
+                self._send(503, {'error': 'Saved recall data are unreadable; restore from an archive',
+                                 'error_code': 'recall_unreadable'})
             return
         # 归档导出走 GET：浏览器直接下载，不需要请求体，也不会被 fetch 的 JSON 解析挡住
         if re.search(r'/api/archive$', path_only):
