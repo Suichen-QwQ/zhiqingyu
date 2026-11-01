@@ -871,10 +871,23 @@ def profile_memory_items(profile_id):
             if line.strip().startswith('- ')]
 
 
-def replace_profile_memory(profile_id, items, hints=None):
+class MemoryConflictError(Exception):
+    pass
+
+
+def _check_memory_snapshot(profile_id, expected_items):
+    if expected_items is not None:
+        if not isinstance(expected_items, list):
+            raise ValueError('expected_items must be an array')
+        if profile_memory_items(profile_id) != expected_items:
+            raise MemoryConflictError('Memory changed; refresh before editing')
+
+
+def replace_profile_memory(profile_id, items, hints=None, expected_items=None):
     if not isinstance(items, list):
         raise ValueError('memory items must be an array')
     with MEM_LOCK:
+        _check_memory_snapshot(profile_id, expected_items)
         _bump_memory_epoch(profile_id)
         return _replace_profile_memory_locked(profile_id, items, hints)
 
@@ -922,33 +935,37 @@ def _replace_profile_memory_locked(profile_id, items, hints=None):
         return False
 
 
-def delete_profile_memory(profile_id, index=None, text=None, item_id=None):
+def delete_profile_memory(profile_id, index=None, text=None, item_id=None, expected_items=None):
     """删除单条记忆：id（v2 推荐）/ index = 列表下标 / text = 按内容匹配（从后往前找第一条命中）。
 
     修复：原实现只删了内存里的副本、没有回写文件 → 永远返回 None，前端显示
     「没有找到该条记忆」，用户侧表现为「记忆不能删除」。
     """
-    if MEMORY_V2:
-        return delete_profile_memory_v2(profile_id, item_id=item_id, index=index, text=text)
-    items = profile_memory_items(profile_id)
-    pos = None
-    if index is not None:
-        try:
-            pos = int(index)
-        except (ValueError, TypeError):
-            pos = None
-        if pos is None or pos < 0 or pos >= len(items):
-            pos = None
-    if pos is None and text is not None:
-        needle = str(text).strip()
-        for i in range(len(items) - 1, -1, -1):
-            if needle and (items[i] == needle or items[i].endswith(needle)):
-                pos = i
-                break
-    if pos is None:
-        return False
-    del items[pos]
-    return replace_profile_memory(profile_id, items)
+    with MEM_LOCK:
+        _check_memory_snapshot(profile_id, expected_items)
+        if MEMORY_V2:
+            return delete_profile_memory_v2(profile_id, item_id=item_id, index=index, text=text)
+        if item_id:
+            return False  # IDs from a v2 list must never target legacy indices.
+        items = profile_memory_items(profile_id)
+        pos = None
+        if index is not None:
+            try:
+                pos = int(index)
+            except (ValueError, TypeError):
+                pos = None
+            if pos is None or pos < 0 or pos >= len(items):
+                pos = None
+        if pos is None and text is not None:
+            needle = str(text).strip()
+            for i in range(len(items) - 1, -1, -1):
+                if needle and (items[i] == needle or items[i].endswith(needle)):
+                    pos = i
+                    break
+        if pos is None:
+            return False
+        del items[pos]
+        return replace_profile_memory(profile_id, items)
 
 
 # ==================== 记忆 v2：结构化存储 + 打分选片 ====================
@@ -1579,14 +1596,14 @@ def delete_profile_memory_v2(profile_id, item_id=None, index=None, text=None):
                     if it.get('id') == str(item_id):
                         pos = i
                         break
-            if pos is None and index is not None:
+            elif index is not None:
                 try:
                     p = int(index)
                 except (TypeError, ValueError):
                     p = -1
                 if 0 <= p < len(items):
                     pos = p
-            if pos is None and text is not None:
+            elif text is not None:
                 needle = str(text).strip()
                 for i in range(len(items) - 1, -1, -1):
                     ct = str(items[i].get('text') or '')
@@ -6577,12 +6594,15 @@ class Handler(BaseHTTPRequestHandler):
             if re.search(r'/api/memory$', self.path):
                 profile_id = payload.get('profile_id') or 'default'
                 action = payload.get('action')
+                if 'expected_items' in payload and not isinstance(payload['expected_items'], list):
+                    raise ValueError('expected_items must be an array')
                 if action == 'clear':
                     self._send(200, {'ok': clear_profile_memory(profile_id)})
                 elif action == 'delete':
                     self._send(200, {'ok': delete_profile_memory(profile_id, payload.get('index'),
                                                                 payload.get('text'),
-                                                                item_id=payload.get('id'))})
+                                                                item_id=payload.get('id'),
+                                                                expected_items=payload.get('expected_items'))})
                 elif action == 'add':
                     if MEMORY_V2:
                         res = write_profile_memory_v2(profile_id, payload.get('text'),
@@ -6616,7 +6636,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, {'ok': merge_profile_memory(profile_id, items), 'count': len(items)})
                 elif action == 'replace':
                     items = payload.get('items')
-                    self._send(200, {'ok': replace_profile_memory(profile_id, items),
+                    self._send(200, {'ok': replace_profile_memory(profile_id, items,
+                                                               expected_items=payload.get('expected_items')),
                                      'count': len(items)})
                 elif action == 'migrate':
                     data = _mem_load_v2(profile_id)
@@ -6708,6 +6729,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 result = handle_chat(payload)
                 self._send(200, result)
+        except MemoryConflictError:
+            self._send(409, {'ok': False, 'error': 'Memory changed; refresh before editing',
+                             'error_code': 'memory_conflict'})
         except StorageReadError:
             self._send(503, {'error': 'Saved conversation data are unreadable; restore from a backup',
                              'error_code': 'storage_unreadable'})

@@ -750,6 +750,42 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(server.read_storage()['data']['sessions'][0]['msgs'], ['recovered'])
         self.assertTrue(any(p.read_bytes() == b'{broken' for p in DATA.glob('.zqy-storage-corrupt-*.bak')))
 
+    def test_missing_memory_id_never_falls_back_to_another_item(self):
+        from unittest.mock import patch
+        pid = 'stable-memory-target'
+        with patch.object(server, 'MEMORY_V2', True):
+            self.assertTrue(server.replace_profile_memory(pid, [{'id': 'keep', 'text': 'keep this fact'}]))
+            self.assertFalse(server.delete_profile_memory(pid, item_id='gone', index=0, text='keep this fact'))
+            self.assertEqual([x['id'] for x in server.memory_snapshot(pid)['items_v2']], ['keep'])
+        with patch.object(server, 'MEMORY_V2', False):
+            self.assertFalse(server.delete_profile_memory(pid, item_id='gone', index=0))
+            self.assertEqual(len(server.profile_memory_items(pid)), 1)
+
+    def test_legacy_memory_edits_reject_changed_snapshot(self):
+        from unittest.mock import patch
+        pid = 'legacy-edit-conflict'
+        def post(data):
+            data['profile_id'] = pid
+            return self.request('POST', '/api/memory', json.dumps(data).encode(), {'Content-Type': 'application/json'})
+        with patch.object(server, 'MEMORY_V2', False):
+            server.replace_profile_memory(pid, ['old fact', 'another fact'])
+            initial = server.profile_memory_items(pid)
+            server.write_profile_memory(pid, 'new fact')
+            current = server.profile_memory_items(pid)
+            for action in ({'action': 'delete', 'index': 0}, {'action': 'replace', 'items': ['edited fact']}):
+                status, _, body = post(dict(action, expected_items=initial))
+                self.assertEqual(status, 409)
+                self.assertEqual(json.loads(body)['error_code'], 'memory_conflict')
+                self.assertEqual(server.profile_memory_items(pid), current)
+            self.assertEqual(post({'action': 'delete', 'index': 0, 'expected_items': None})[0], 400)
+            status, _, body = post({'action': 'delete', 'index': 0, 'expected_items': current})
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)['ok'])
+            self.assertEqual(server.profile_memory_items(pid), current[1:])
+            self.assertTrue(json.loads(post({'action': 'replace', 'items': ['edited fact'],
+                                            'expected_items': current[1:]})[2])['ok'])
+            self.assertEqual(server.profile_memory_items(pid), ['edited fact'])
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

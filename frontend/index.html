@@ -4571,6 +4571,7 @@
     let MEM_ITEMS=[];    /* GET 的 items：字符串数组（含「日期 时间」前缀）——旧接口 + 降级用 */
     let MEM_V2=[];       /* GET 的 items_v2：对象数组；旧后端没有 → [] */
     let MEM_ROWS=[];     /* 归一化后的渲染行 */
+    let MEM_LOAD_SEQ=0;
     let MEM_STATS=null;  /* GET 的 stats：可能有，也可能没有 */
     const MEM_FILTER={q:'',cat:'all'};
     function memCatLabel(c){ return MEM_CAT_LABEL[c]||''; }
@@ -4592,7 +4593,7 @@
       }catch(e){ return {ok:false,status:0,data:null,net:true}; }
     }
     /* GET 归一化：items_v2 优先；旧后端没有 items_v2 → 用 items 按原样解析（无分类/重要度/置顶） */
-    function memBuildRows(data){
+    function memBuildRows(data,targetProfile=profileId()){
       const items=(data&&Array.isArray(data.items))?data.items:[];
       const v2=(data&&Array.isArray(data.items_v2))?data.items_v2:[];
       const rows=[];
@@ -4600,7 +4601,7 @@
         v2.forEach(function(o,i){
           if(!o||typeof o!=='object') return;
           const imp=parseInt(o.imp,10);
-          rows.push({v2:true,idx:i,id:(o.id==null?'':String(o.id)),
+          rows.push({v2:true,profile_id:targetProfile,idx:i,id:(o.id==null?'':String(o.id)),
             text:String(o.text||''),cat:String(o.cat||''),
             imp:(isFinite(imp)&&imp>=1)?Math.min(5,imp):0,
             created:String(o.created||''),pinned:!!o.pinned});
@@ -4610,7 +4611,7 @@
         items.forEach(function(s,i){
           if(typeof s!=='string') return;
           const p=memParts(s);
-          rows.push({v2:false,idx:i,id:'',text:p.fact,cat:'',imp:0,created:p.ts,pinned:false});
+          rows.push({v2:false,profile_id:targetProfile,expected_items:items.slice(),idx:i,id:'',text:p.fact,cat:'',imp:0,created:p.ts,pinned:false});
         });
       }
       return {rows:rows,items:items,v2:v2};
@@ -4665,7 +4666,11 @@
       row.appendChild(main); row.appendChild(acts);
       return row;
     }
-    /* 行内编辑：文本 + 分类 + 重要度；保存走 action=update（id），失败降级为整表 replace */
+    function memCheckProfile(r){
+      if(r.profile_id===profileId())return true;
+      showToast('身份已变化，请刷新记忆后重试');loadMem();return false;
+    }
+    /* 按稳定 ID 编辑；旧格式整表编辑必须验证原始快照。 */
     function memEdit(row,r){
       const wrap=document.createElement('div'); wrap.className='mem-edit';
       const inp=document.createElement('input');
@@ -4706,6 +4711,7 @@
       });
       okBtn.addEventListener('click',save);
       async function save(){
+        if(okBtn.disabled||!memCheckProfile(r))return;
         const v=(inp.value||'').trim();
         if(!v){ showToast('内容不能为空'); inp.focus(); return; }
         const cat=catSel?catSel.value:r.cat;
@@ -4714,57 +4720,42 @@
         if(!changed){ loadMem(); return; }
         okBtn.disabled=true;
         let saved=false;
-        if(r.v2&&r.id){
-          const res=await memPost({action:'update',id:r.id,text:v,cat:cat,imp:imp});
+        if(r.v2){
+          const res=r.id?await memPost({profile_id:r.profile_id,action:'update',id:r.id,text:v,cat:cat,imp:imp}):{ok:false};
           saved=!!res.ok;
-          /* 旧后端不认 update（400 / ok:false）→ 整表 replace 兜底，分类/重要度/置顶一并保住 */
-          if(!saved&&!res.net) saved=await memSaveReplace(r,v,cat,imp);
-          showToast(saved?'已更新这条记忆':(res.net?'网络不太好，暂时没保存上':'暂时无法保存'));
+          showToast(saved?'已更新这条记忆':(res.status===409?'记忆已变化，请刷新后重试':(res.net?'网络不太好，暂时没保存上':'暂时无法保存')));
         }else{
-          const next=MEM_ITEMS.slice();
+          const next=r.expected_items.slice();
           next[r.idx]=((r.created?r.created+' ':'')+v).trim();
-          const res=await memPost({action:'replace',items:next});
+          const res=await memPost({profile_id:r.profile_id,action:'replace',items:next,expected_items:r.expected_items});
           if(res.ok){ saved=true; MEM_ITEMS=next; }
-          showToast(saved?'已更新这条记忆':(res.net?'网络不太好，暂时没保存上':'暂时无法保存'));
+          showToast(saved?'已更新这条记忆':(res.status===409?'记忆已变化，请刷新后重试':(res.net?'网络不太好，暂时没保存上':'暂时无法保存')));
         }
         okBtn.disabled=false;
         loadMem();
       }
     }
-    function memObjToString(o){
-      const ts=String((o&&o.created)||'').trim();
-      const tx=String((o&&o.text)||'').trim();
-      return ts?ts+' '+tx:tx;
-    }
-    /* update 失败时的兜底：新后端收对象数组（元信息全保留）；再不行退回字符串数组（旧后端格式） */
-    async function memSaveReplace(r,text,cat,imp){
-      if(!MEM_V2.length) return false;
-      const objs=MEM_V2.map(function(o){
-        if(!o||String(o.id)!==r.id) return o;
-        return Object.assign({},o,{text:text,cat:cat,imp:imp});
-      });
-      if((await memPost({action:'replace',items:objs})).ok){ MEM_V2=objs; return true; }
-      return !!(await memPost({action:'replace',items:objs.map(memObjToString)})).ok;
-    }
     async function memPin(r,btn){
+      if((btn&&btn.disabled)||!memCheckProfile(r))return;
       if(!r.id){ showToast('暂时无法置顶'); return; }
       const want=!r.pinned;
       if(btn) btn.disabled=true;
-      const res=await memPost({action:'pin',id:r.id,pinned:want});
+      const res=await memPost({profile_id:r.profile_id,action:'pin',id:r.id,pinned:want});
       if(btn) btn.disabled=false;
       if(res.ok){ showToast(want?'已置顶':'已取消置顶'); loadMem(); return; }
       showToast('暂时无法置顶');    /* 旧后端没有 pin：保持原样，不报错 */
       loadMem();
     }
     async function memDelete(r){
+      if(!memCheckProfile(r))return;
       if(!await zqyConfirm({title:'删掉这条记忆？',body:r.text,danger:true})) return;
-      let done=false;
+      if(!memCheckProfile(r))return;
+      let result={ok:false};
       try{
-        if(r.v2&&r.id) done=(await memPost({action:'delete',id:r.id})).ok;
-        /* 降级：旧后端只认 index，且必须是「全量列表」里的下标（不能用过滤后的下标） */
-        if(!done) done=(await memPost({action:'delete',index:r.idx})).ok;
-      }catch(e){ done=false; }
-      showToast(done?'已删除这条记忆':'没有找到该条记忆');
+        if(r.v2){if(r.id)result=await memPost({profile_id:r.profile_id,action:'delete',id:r.id});}
+        else result=await memPost({profile_id:r.profile_id,action:'delete',index:r.idx,expected_items:r.expected_items});
+      }catch(e){}
+      showToast(result.ok?'已删除这条记忆':(result.status===409?'记忆已变化，请刷新后重试':'未能删除，请刷新后重试'));
       loadMem();
     }
     function memCountText(){
@@ -4802,15 +4793,24 @@
     }
     async function loadMem(){
       if(!memList) return;
-      memList.textContent='';
+      const seq=++MEM_LOAD_SEQ,targetProfile=profileId();
+      MEM_ITEMS=[];MEM_V2=[];MEM_ROWS=[];MEM_STATS=null;
+      memList.textContent='';if(memCount)memCount.textContent='';
       const loading=document.createElement('div'); loading.className='mem-empty'; loading.textContent='正在读取…';
       memList.appendChild(loading);
-      let data=null;
-      try{ data=await fetch('api/memory?profile_id='+encodeURIComponent(profileId())).then(function(r){ return r.json(); }); }catch(e){ data=null; }
-      const built=memBuildRows(data);
-      MEM_ITEMS=built.items; MEM_V2=built.v2; MEM_ROWS=built.rows;
-      MEM_STATS=(data&&data.stats&&typeof data.stats==='object')?data.stats:null;
-      memPaint();
+      try{
+        const response=await fetch('api/memory?profile_id='+encodeURIComponent(targetProfile)),data=await response.json();
+        if(seq!==MEM_LOAD_SEQ||targetProfile!==profileId())return;
+        if(!response.ok||!data||!Array.isArray(data.items))throw new Error('memory unavailable');
+        const built=memBuildRows(data,targetProfile);
+        MEM_ITEMS=built.items; MEM_V2=built.v2; MEM_ROWS=built.rows;
+        MEM_STATS=(data.stats&&typeof data.stats==='object')?data.stats:null;
+        memPaint();
+      }catch(e){
+        if(seq!==MEM_LOAD_SEQ||targetProfile!==profileId())return;
+        memList.textContent='';memList.appendChild(loading);
+        loading.textContent='记忆读取失败，请刷新重试';
+      }
     }
     if(memSearch) memSearch.addEventListener('input',function(){
       MEM_FILTER.q=memSearch.value||''; memPaint();   /* 纯本地过滤，不发请求 */
@@ -4830,20 +4830,24 @@
     }
     const memClear=document.getElementById('memClear');
     if(memClear) memClear.addEventListener('click',async function(){
+      const targetProfile=profileId();
       if(!await zqyConfirm({title:'清空屿记住的全部内容？',body:'对话记录会保留，但屿会重新认识你。',danger:true})) return;
-      const res=await memPost({action:'clear'});
+      if(!memCheckProfile({profile_id:targetProfile}))return;
+      const res=await memPost({profile_id:targetProfile,action:'clear'});
       showToast(res.ok?'已清空全部记忆':'暂时无法清空记忆');
       loadMem();
     });
     const memAddIn=document.getElementById('memAddIn'), memAddGo=document.getElementById('memAddGo');
     async function memAdd(){
+      if(memAddGo.disabled)return;
+      const targetProfile=profileId();
       const v=(memAddIn.value||'').trim();
       if(!v){ showToast('先写一句要记住的话'); memAddIn.focus(); return; }
       memAddGo.disabled=true;
-      const res=await memPost({action:'add',text:v});   /* 只传文本：分类 / 重要度由后端判定 */
+      const res=await memPost({profile_id:targetProfile,action:'add',text:v});   /* 只传文本：分类 / 重要度由后端判定 */
       const dup=!!(res.data&&res.data.duplicate);
       if(res.ok){
-        memAddIn.value='';
+        if(targetProfile===profileId()&&memAddIn.value.trim()===v)memAddIn.value='';
         showToast(dup?'这条已经记过了':'已添加');
       }else if(dup||(res.status===200&&res.data&&res.data.ok===false)){
         showToast('这条已经记过了');   /* 旧后端重复时返回 200 + ok:false */
