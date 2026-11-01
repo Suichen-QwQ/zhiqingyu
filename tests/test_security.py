@@ -410,6 +410,74 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(result['error_code'], 'archive_invalid_storage')
         self.assertEqual(server.read_storage()['revision'], revision)
 
+    def test_stale_memory_model_result_cannot_resurrect_cleared_facts(self):
+        from unittest.mock import patch
+        for mode in (False, True):
+            pid = 'cleared-model-%s' % mode
+            with patch.object(server, 'MEMORY_V2', mode):
+                server.clear_profile_memory(pid)
+                def cleared_during_model(*args, **kwargs):
+                    server.clear_profile_memory(pid)
+                    return {'content': json.dumps({'add': ['stale fact'], 'forget': [], 'update': []})}
+                with patch.object(server, '_chat_small', side_effect=cleared_during_model):
+                    result = server.manage_memory(pid, 'test message')
+                self.assertEqual(result['added'], [])
+                self.assertEqual(server.profile_memory_items(pid), [])
+
+    def test_memory_model_result_does_not_overwrite_concurrent_add(self):
+        from unittest.mock import patch
+        pid = 'concurrent-model'
+        server.replace_profile_memory(pid, ['initial fact'])
+        def live_add(*args, **kwargs):
+            server.write_profile_memory(pid, 'new live fact')
+            return {'content': json.dumps({'add': ['model stale fact'], 'forget': [0], 'update': []})}
+        with patch.object(server, '_chat_small', side_effect=live_add):
+            result = server.manage_memory(pid, 'test message')
+        self.assertEqual(result['forgot'], [])
+        facts = [server._split_mem_item(item)[1] for item in server.profile_memory_items(pid)]
+        self.assertIn('initial fact', facts)
+        self.assertIn('new live fact', facts)
+        self.assertNotIn('model stale fact', facts)
+
+    def test_old_turn_and_fallback_cannot_write_after_memory_reset(self):
+        from unittest.mock import patch
+        pid = 'old-turn'
+        epoch = server.memory_control_epoch(pid)
+        server.clear_profile_memory(pid)
+        with patch.object(server, 'manage_memory', side_effect=AssertionError('stale turn reached model')):
+            self.assertEqual(server.update_turn_memory(pid, 'old message', epoch)['added'], [])
+        epoch = server.memory_control_epoch(pid)
+        def reset_during_fallback(*args):
+            server.clear_profile_memory(pid)
+            return 'stale fallback fact'
+        with patch.object(server, 'manage_memory', return_value=None), patch.object(server, '_extract_fact', side_effect=reset_during_fallback):
+            self.assertEqual(server.update_turn_memory(pid, 'old message', epoch)['added'], [])
+        self.assertEqual(server.profile_memory_items(pid), [])
+
+    def test_bad_memory_replace_cannot_clear_existing_facts(self):
+        pid = 'invalid-replace'
+        server.replace_profile_memory(pid, ['keep this fact'])
+        for items in ({}, None, 'wrong shape'):
+            payload = json.dumps({'profile_id': pid, 'action': 'replace', 'items': items}).encode()
+            status, _, _ = self.request('POST', '/api/memory', payload, {'Content-Type': 'application/json'})
+            self.assertEqual(status, 400)
+            self.assertEqual(server.profile_memory_items(pid), ['keep this fact'])
+
+    def test_current_turn_memory_updates_still_persist_in_both_modes(self):
+        from unittest.mock import patch
+        for mode in (False, True):
+            pid = 'valid-model-%s' % mode
+            with patch.object(server, 'MEMORY_V2', mode):
+                server.replace_profile_memory(pid, ['original fact'])
+                epoch = server.memory_control_epoch(pid)
+                model = {'content': json.dumps({'forget': [], 'update': [{'index': 0, 'fact': 'updated fact'}], 'add': ['new fact']})}
+                with patch.object(server, '_chat_small', return_value=model):
+                    result = server.update_turn_memory(pid, 'new message', epoch)
+                facts = [server._split_mem_item(item)[1] for item in server.profile_memory_items(pid)]
+                self.assertEqual(set(facts), {'updated fact', 'new fact'})
+                self.assertEqual(result['updated'], ['updated fact'])
+                self.assertTrue(result['added'])
+
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
         self.assertEqual(status, 428)

@@ -3725,6 +3725,18 @@
     else out.cancelled=true;
     return out;
   }
+  function createStreamWatchdog(onTimeout,idleMs=600000,totalMs=1800000){
+    let idleTimer=null,totalTimer=null,stopped=false;
+    function expire(){if(stopped)return;stop();onTimeout();}
+    function touch(waitMs=0){
+      if(stopped)return;
+      if(idleTimer!==null)clearTimeout(idleTimer);
+      idleTimer=setTimeout(expire,Math.max(idleMs,waitMs));
+    }
+    function stop(){stopped=true;clearTimeout(idleTimer);clearTimeout(totalTimer);}
+    totalTimer=setTimeout(expire,totalMs);touch();
+    return {touch,stop};
+  }
   async function askYu(text,id,avoid){
     const requestSession=curSess();
     typingEl.querySelector('.typing-label').textContent='正在回应';
@@ -3754,12 +3766,12 @@
     if(tmp.think!==undefined) payload.think=tmp.think;
     if(tmp.search!==undefined) payload.search=tmp.search;
     if(avoid) payload.avoid=avoid;
-    const ctrl=new AbortController(), limit=(payload.think||payload.search)?70000:30000;
+    const ctrl=new AbortController();
     const req={ctrl:ctrl,stopped:false,timedOut:false,sessionId:requestSession.id}; activeRequest=req;
     if(sendEl) sendEl.hidden=true;
     if(stopEl) stopEl.hidden=false;
     /* 墙钟兜底也要留下来源：它不是用户点的停止，不能和「已停止生成」混为一谈。 */
-    const tmr=setTimeout(()=>{ req.timedOut=true; ctrl.abort(); },limit);
+    const watchdog=createStreamWatchdog(()=>{req.timedOut=true;ctrl.abort();});
     const withTide=Math.random()>0.4;
     const m={id:uid(),role:'ai',replyTo:id,text:'',ts:Date.now(),emo:'平静',theme:'',tide:withTide,partnerName:payload.persona.name||''};
     req.partialMessage=m;req.sourceSession=requestSession;
@@ -3775,6 +3787,7 @@
       const reader=res.body.getReader(), decoder=new TextDecoder(); let buf='';
       while(true){
         const part=await reader.read(); if(req.stopped)throw new DOMException('Stopped','AbortError'); if(part.done) break;
+        watchdog.touch();
         buf+=decoder.decode(part.value,{stream:true});
         let cut; while((cut=buf.indexOf('\n\n'))>=0){
           const block=buf.slice(0,cut); buf=buf.slice(cut+2);
@@ -3789,6 +3802,7 @@
           else if(type==='thinking'){ showNote('正在思考'); }
           else if(type==='searching'){ showNote('正在查资料'); }
           else if(type==='ask'){
+            watchdog.touch((Math.max(0,Number(data.timeout)||0)+15)*1000);
             /* 提问卡片：挂到正在流的这条消息下面。后端会阻塞等 api/answer，
                等到答案后同一条流继续吐 delta，所以卡片不能是弹窗。 */
             const vm0=askViewModel(data);
@@ -3837,6 +3851,7 @@
           else if(type==='error'){ errData=data; }
         }
       }
+      watchdog.stop();
       if(req.stopped)throw new DOMException('Stopped','AbortError');
       /* 模型链全挂：后端先发 event:error、再发 done{failed:true}。
          保留已经流出来的半截正文，其余交给提示气泡（不再编默认回复）。 */
@@ -3901,7 +3916,7 @@
           : '连接中途断了，点重试再来一次', '', null);
       } else markFailed(id);
     }finally{
-      clearTimeout(tmr);
+      watchdog.stop();
       if(activeRequest===req){
         typingEl.style.display='none';thinkEl.classList.remove('on');
         if(stopEl)stopEl.hidden=true;if(sendEl)sendEl.hidden=false;
@@ -4434,6 +4449,7 @@
       if(genBusy) return;
       const dream=drmIn.value.trim();
       if(!dream){ genTip.textContent='先描述一下你想要的陪伴者'; return; }
+      const generationMeta=DB.meta;
       genBusy=true;
       genBtn.disabled=true; genBtn.classList.add('busy');
       pnChain.hidden=true; pnChainBody.textContent='';
@@ -4455,10 +4471,12 @@
         if(!r.ok) throw new Error('HTTP '+r.status);
         const d=await r.json();
         if(!d||!d.name||!d.desc||!d.rules) throw new Error('empty');
+        if(DB.meta!==generationMeta){genTip.textContent='数据已变化，未保存旧的生成结果';return;}
         /* 自动保存为自定义预设：模板列表可见、可复用、可删除 */
         const presets=(DB.meta&&DB.meta.presets)||(DB.meta.presets=[]);
         const pid='p'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
         presets.push({id:pid,name:d.name,desc:d.desc,rules:d.rules});
+        dbSave();
         curKind='preset:'+pid;
         renderTpls();
         nIn.value=d.name.slice(0,8);
@@ -6978,17 +6996,23 @@
         }
         if(cloudT) {clearTimeout(cloudT);cloudT=null;}
         cloudBusy=true;
+        const wipeProfile=profileId();let storageCleared=false;
+        if(window.zqyCancelChat)window.zqyCancelChat();
         try{
           const response=await fetch('api/storage',{method:'POST',headers:{'Content-Type':'application/json'},
             body:JSON.stringify({clear:true,expected_revision:cloudRevision,data:{v:SCHEMA,sessions:[],activeId:null,diary:{},meta:{}}})});
           const result=await response.json();
           if(!response.ok||!result.ok){cloudState='error';showToast('云端数据已变化或清空失败，已保留本机数据');return;}
-          cloudRevision=result.revision;
-          await fetch('api/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear',profile_id:profileId()})}).catch(()=>{});
+          cloudRevision=result.revision;storageCleared=true;
+          for(const endpoint of ['api/memory','api/recall']){
+            const cleared=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear',profile_id:wipeProfile})});
+            const detail=await cleared.json();
+            if(!cleared.ok||!detail||!detail.ok)throw new Error('memory clear failed');
+          }
           dbReset(); setCloudUnsynced(false);
           wipeMask.hidden=true; closeDrawer(); if(window.zqyCloseSettings) window.zqyCloseSettings();
           renderSession(); showToast('已清空本机数据与记忆');
-        }catch(e){cloudState='error';showToast('清空失败，已保留本机数据');}
+        }catch(e){cloudState='error';showToast(storageCleared?'云端对话已清空，但记忆或回忆清空失败；本机数据仍保留，请先导出备份':'清空失败，已保留本机数据');}
         finally{cloudBusy=false;}
       });
       if(wipeCancel) wipeCancel.addEventListener('click',()=>{ wipeMask.hidden=true; });

@@ -1,5 +1,5 @@
 const fs=require('fs'),vm=require('vm'),assert=require('assert');const html=fs.readFileSync('frontend/index.html','utf8');
-const start=html.indexOf('  async function askYu('),end=html.indexOf('  /* ===== 表情包',start);
+const start=html.indexOf('  function createStreamWatchdog('),end=html.indexOf('  /* ===== 表情包',start);
 const cancelStart=html.indexOf('  window.zqyCancelChat=function('),cancelEnd=html.indexOf('  const typingVis=',cancelStart);
 const a={id:'a',msgs:[{id:'question',role:'me',text:'hi'}]},b={id:'b',msgs:[]},DB={sessions:[a,b],activeId:'a'};
 let abortRead,readCount=0,saved=0;

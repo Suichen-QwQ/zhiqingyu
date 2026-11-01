@@ -1,0 +1,7 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');const h=fs.readFileSync('frontend/index.html','utf8'),start=h.indexOf("      wipeConfirm.addEventListener('click',async()=>{"),end=h.indexOf('      if(wipeCancel)',start);
+async function run(failure){let handler,resets=0,notices=[],requests=[];const c={cloudBusy:false,cloudState:'restored',cloudRevision:'v',cloudT:null,SCHEMA:2,window:{},profileId:()=> 'original-profile',
+ wipeConfirm:{addEventListener:(event,fn)=>handler=fn},wipeMask:{hidden:false},closeDrawer(){},dbReset:()=>resets++,setCloudUnsynced(){},renderSession(){},showToast:t=>notices.push(t),
+ fetch:async(url,options)=>{requests.push([url,JSON.parse(options.body)]);if(url==='api/storage')return {ok:true,json:async()=>({ok:true,revision:'new'})};return {ok:!failure,json:async()=>({ok:!failure})};}};
+vm.createContext(c);vm.runInContext(h.slice(start,end),c);await handler();return {c,resets,notices,requests};}
+(async()=>{const failed=await run(true);assert.equal(failed.resets,0);assert.equal(failed.c.cloudState,'error');assert(failed.notices.some(x=>x.includes('云端对话已清空')));assert(!failed.notices.some(x=>x==='已清空本机数据与记忆'));
+const ok=await run(false);assert.equal(ok.resets,1);assert.equal(ok.requests.map(x=>x[0]).join(','),'api/storage,api/memory,api/recall');assert(ok.requests.slice(1).every(x=>x[1].profile_id==='original-profile'));console.log('clear-all detects partial failure and confirms memory plus recall deletion passed')})().catch(e=>{console.error(e);process.exitCode=1});

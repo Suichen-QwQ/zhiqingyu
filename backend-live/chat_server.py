@@ -56,6 +56,7 @@ MEMORY_FILE = os.environ.get('ZQY_MEMORY_FILE', os.path.join(SERVER_DIR, 'memory
 
 # 记忆文件是「读-改-写」整表覆写，多线程（ThreadingHTTPServer）并发时必须串行化
 MEM_LOCK = threading.RLock()
+MEM_CONTROL_EPOCHS = {}
 MEMORY_DIR = os.environ.get('ZQY_MEMORY_DIR', os.path.join(SERVER_DIR, 'memories'))
 SETTINGS_FILE = os.environ.get('ZQY_SETTINGS_FILE', os.path.join(SERVER_DIR, 'settings.json'))
 SETTINGS_LOCK = threading.RLock()
@@ -839,9 +840,20 @@ def write_profile_memory(profile_id, text, cat=None, imp=None):
         return False
 
 
+def memory_control_epoch(profile_id):
+    with MEM_LOCK:
+        return MEM_CONTROL_EPOCHS.get(_profile_id(profile_id), 0)
+
+
+def _bump_memory_epoch(profile_id):
+    key = _profile_id(profile_id)
+    MEM_CONTROL_EPOCHS[key] = MEM_CONTROL_EPOCHS.get(key, 0) + 1
+
+
 def clear_profile_memory(profile_id):
     try:
         with MEM_LOCK:
+            _bump_memory_epoch(profile_id)
             path = _profile_memory_file(profile_id)
             if os.path.isfile(path):
                 os.remove(path)
@@ -860,6 +872,14 @@ def profile_memory_items(profile_id):
 
 
 def replace_profile_memory(profile_id, items, hints=None):
+    if not isinstance(items, list):
+        raise ValueError('memory items must be an array')
+    with MEM_LOCK:
+        _bump_memory_epoch(profile_id)
+        return _replace_profile_memory_locked(profile_id, items, hints)
+
+
+def _replace_profile_memory_locked(profile_id, items, hints=None):
     """整表覆写记忆（保留每条自带的「日期 时间」前缀；空表 = 删除文件）。
 
     修复：原实现把每条截到 60 字、超过 30 条丢弃，备份恢复时会静默丢记忆。
@@ -2764,6 +2784,7 @@ def merge_profile_memory(profile_id, raw_items):
                 texts.add(text)
                 ids.add(item['id'])
             data['items'] = items
+            _bump_memory_epoch(profile_id)
             _mem_save_v2(profile_id, data)
             return True
         items = profile_memory_items(profile_id)
@@ -2786,14 +2807,18 @@ def restore_profile_memory(profile_id, lines):
     return merge_profile_memory(profile_id, lines or [])
 
 
-def manage_memory(profile_id, message):
+def manage_memory(profile_id, message, expected_epoch=None):
     """LLM 统一管理长期记忆：一次调用决定 增(add) / 改(update) / 删(forget)。
 
     返回 {'added': [整行], 'updated': [新事实], 'forgot': [事实], 'forgot_raw': [整行]}；
     调用或解析失败 → None（调用方回退到只增的 _extract_fact）。
     设计：拿不准就不删（删错比少删更伤），删掉的整行回传前端供「撤销」。
     """
-    items = profile_memory_items(profile_id)
+    with MEM_LOCK:
+        epoch = memory_control_epoch(profile_id)
+        if expected_epoch is not None and epoch != expected_epoch:
+            return {'added': [], 'updated': [], 'forgot': [], 'forgot_raw': []}
+        items = profile_memory_items(profile_id)
     listing = '\n'.join('%d. %s' % (i, it) for i, it in enumerate(items)) or '（目前没有记忆）'
     system = (
         "你是记忆库管理员。下面编号是当前已记住的用户长期记忆，"
@@ -2901,12 +2926,35 @@ def manage_memory(profile_id, message):
         added.append(line)
         if hint:
             hints[a] = hint
-    if not replace_profile_memory(profile_id, new_items, hints):
-        return None
+    with MEM_LOCK:
+        if memory_control_epoch(profile_id) != epoch or profile_memory_items(profile_id) != items:
+            return {'added': [], 'updated': [], 'forgot': [], 'forgot_raw': []}
+        if not replace_profile_memory(profile_id, new_items, hints):
+            return None
     return {'added': added,
             'updated': [u[3] for u in updates],
             'forgot': [_split_mem_item(x)[1] for x in forgot_raw],
             'forgot_raw': forgot_raw}
+
+
+def update_turn_memory(profile_id, message, epoch):
+    empty = {'added': [], 'updated': [], 'forgot': [], 'forgot_raw': []}
+    with MEM_LOCK:
+        if memory_control_epoch(profile_id) != epoch:
+            return empty
+        snapshot = profile_memory_items(profile_id)
+    ops = manage_memory(profile_id, message, expected_epoch=epoch)
+    if ops is not None:
+        return ops
+    with MEM_LOCK:
+        if memory_control_epoch(profile_id) != epoch:
+            return empty
+    fact = _extract_fact(message)
+    with MEM_LOCK:
+        if memory_control_epoch(profile_id) != epoch or profile_memory_items(profile_id) != snapshot:
+            return empty
+        empty['added'] = [fact] if fact and write_profile_memory(profile_id, fact) else []
+    return empty
 
 
 def _write_memory(text):
@@ -3580,6 +3628,7 @@ def _stream_chat_inner(payload):
         raise ValueError('message 不能为空')
     history = payload.get('history') or []
     profile_id = payload.get('profile_id') or 'default'
+    turn_memory_epoch = memory_control_epoch(profile_id)
     memorize = bool(payload.get('memorize')) if payload.get('memorize') is not None else True
     cite_on = memory_citations_enabled(payload)
     memory, mem_stats = memory_for_prompt(profile_id, message, memorize, citations=cite_on)
@@ -3902,11 +3951,7 @@ def _stream_chat_inner(payload):
     # 记忆：LLM 统一管理（增 / 改 / 删），失败回退到只增的 _extract_fact，不影响对话
     if memorize and (think or _should_extract(message) or _should_forget(message)):
         try:
-            ops = manage_memory(profile_id, message)
-            if ops is None:
-                fact = _extract_fact(message)
-                ops = {'added': [fact] if (fact and write_profile_memory(profile_id, fact)) else [],
-                       'updated': [], 'forgot': [], 'forgot_raw': []}
+            ops = update_turn_memory(profile_id, message, turn_memory_epoch)
             if ops['added']:
                 out['remembered'] = _split_mem_item(ops['added'][0])[1][:60]
             if ops['updated']:
@@ -4967,6 +5012,7 @@ def handle_chat(payload):
     history = payload.get('history') or []
     avoid = payload.get('avoid') or None
     profile_id = payload.get('profile_id') or 'default'
+    turn_memory_epoch = memory_control_epoch(profile_id)
     summary = str(payload.get('summary') or '')[:800]
     # P7 会话摘要记账：folded = 本轮刚滑出逐字窗口的消息（前端算好的 delta）；
     # 老前端不传 → folded is None → build_local_summary 退回旧行为。
@@ -5074,11 +5120,7 @@ def handle_chat(payload):
     # 记忆：LLM 统一管理（增 / 改 / 删），失败回退到只增的 _extract_fact，不影响对话
     if memorize and (think or _should_extract(message) or _should_forget(message)):
         try:
-            ops = manage_memory(profile_id, message)
-            if ops is None:
-                fact = _extract_fact(message)
-                ops = {'added': [fact] if (fact and write_profile_memory(profile_id, fact)) else [],
-                       'updated': [], 'forgot': [], 'forgot_raw': []}
+            ops = update_turn_memory(profile_id, message, turn_memory_epoch)
             if ops['added']:
                 out['remembered'] = _split_mem_item(ops['added'][0])[1][:60]
             if ops['updated']:
@@ -5769,6 +5811,8 @@ def _archive_write(path, text, force):
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 f.write(strip_lone_surrogates(text))
             os.replace(tmp, path)
+            if lock is MEM_LOCK:
+                _bump_memory_epoch(os.path.splitext(os.path.basename(path))[0])
             return 'restored'
         finally:
             if os.path.exists(tmp):
@@ -6457,10 +6501,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, {'ok': restore_profile_memory(profile_id, items),
                                      'count': len(items)})
                 elif action == 'merge':
-                    items = payload.get('items') or []
+                    items = payload.get('items', [])
                     self._send(200, {'ok': merge_profile_memory(profile_id, items), 'count': len(items)})
                 elif action == 'replace':
-                    items = payload.get('items') or []
+                    items = payload.get('items')
                     self._send(200, {'ok': replace_profile_memory(profile_id, items),
                                      'count': len(items)})
                 elif action == 'migrate':
