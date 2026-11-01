@@ -784,14 +784,20 @@ def _profile_memory_file(profile_id):
     return os.path.join(MEMORY_DIR, _profile_id(profile_id) + '.md')
 
 
+class MemoryReadError(Exception):
+    pass
+
+
 def read_profile_memory_raw(profile_id):
     """读取记忆全文（不截断）。列表 / 删除 / 替换都走这里，避免只看到注入用的前 4000 字。"""
     try:
         with MEM_LOCK:                       # 与 os.replace 互斥，避免 Windows 共享冲突
             with open(_profile_memory_file(profile_id), 'r', encoding='utf-8') as f:
                 return f.read()
-    except Exception:
+    except FileNotFoundError:
         return ''
+    except Exception as e:
+        raise MemoryReadError('Saved memory is unreadable; restore from an archive') from e
 
 
 def read_profile_memory(profile_id):
@@ -836,6 +842,8 @@ def write_profile_memory(profile_id, text, cat=None, imp=None):
             items.append('%s %s' % (time.strftime('%Y-%m-%d %H:%M'), line))
             _atomic_write_memory(profile_id, items)
             return True
+    except MemoryReadError:
+        raise
     except Exception:
         return False
 
@@ -883,16 +891,16 @@ def _check_memory_snapshot(profile_id, expected_items):
             raise MemoryConflictError('Memory changed; refresh before editing')
 
 
-def replace_profile_memory(profile_id, items, hints=None, expected_items=None):
+def replace_profile_memory(profile_id, items, hints=None, expected_items=None, preserve=False):
     if not isinstance(items, list):
         raise ValueError('memory items must be an array')
     with MEM_LOCK:
         _check_memory_snapshot(profile_id, expected_items)
         _bump_memory_epoch(profile_id)
-        return _replace_profile_memory_locked(profile_id, items, hints)
+        return _replace_profile_memory_locked(profile_id, items, hints, preserve=preserve)
 
 
-def _replace_profile_memory_locked(profile_id, items, hints=None):
+def _replace_profile_memory_locked(profile_id, items, hints=None, preserve=False):
     """整表覆写记忆（保留每条自带的「日期 时间」前缀；空表 = 删除文件）。
 
     修复：原实现把每条截到 60 字、超过 30 条丢弃，备份恢复时会静默丢记忆。
@@ -904,21 +912,24 @@ def _replace_profile_memory_locked(profile_id, items, hints=None):
             with MEM_LOCK:
                 str_lines = [str(x).strip() for x in raw_items
                              if not isinstance(x, dict) and str(x).strip()]
-                merged = _mem_reconcile(profile_id, str_lines, hints) if str_lines else []
+                merged = _mem_reconcile(profile_id, str_lines, hints, truncate=not preserve) if str_lines else []
                 for raw in raw_items:
                     if isinstance(raw, dict):
-                        it = _mem_norm_item(raw)
+                        it = _mem_norm_item(raw, truncate=not preserve)
                         if it:
                             merged.append(it)
-                _mem_save_v2(profile_id, {'items': merged})
+                _mem_save_v2(profile_id, {'items': merged}, enforce_limit=not preserve)
                 return True
+        except MemoryReadError:
+            raise
         except Exception as e:
             sys.stderr.write('[memory] replace v2 failed: %s\n' % str(e)[:160])
             return False
+    profile_memory_items(profile_id)  # Never overwrite an unreadable legacy file.
     clean = []
     for item in raw_items:
         if isinstance(item, dict):
-            normalized = _mem_norm_item(item)
+            normalized = _mem_norm_item(item, truncate=not preserve)
             clean.extend(_mem_items_to_lines([normalized]) if normalized else [])
         elif str(item).strip():
             clean.append(str(item).strip())
@@ -929,7 +940,7 @@ def _replace_profile_memory_locked(profile_id, items, hints=None):
                 if os.path.isfile(path):
                     os.remove(path)
                 return True
-            _atomic_write_memory(profile_id, clean[:200])
+            _atomic_write_memory(profile_id, clean if preserve else clean[:200])
             return True
     except Exception:
         return False
@@ -965,7 +976,7 @@ def delete_profile_memory(profile_id, index=None, text=None, item_id=None, expec
         if pos is None:
             return False
         del items[pos]
-        return replace_profile_memory(profile_id, items)
+        return replace_profile_memory(profile_id, items, preserve=True)
 
 
 # ==================== 记忆 v2：结构化存储 + 打分选片 ====================
@@ -1025,7 +1036,7 @@ def _mem_guess_cat(text):
     return 'other'
 
 
-def _mem_norm_item(raw, hints=None):
+def _mem_norm_item(raw, hints=None, truncate=True):
     """字符串 / dict → 规范 dict；无法识别 → None。hints 可提供 cat / imp。"""
     now = _mem_now_str()
     hints = hints or {}
@@ -1068,7 +1079,7 @@ def _mem_norm_item(raw, hints=None):
         updated = created
     if cat not in MEM_CATS:
         cat = _mem_guess_cat(text)
-    return {'id': item_id, 'text': text[:MEM_ITEM_TEXT_MAX], 'cat': cat,
+    return {'id': item_id, 'text': text[:MEM_ITEM_TEXT_MAX] if truncate else text, 'cat': cat,
             'imp': max(1, min(5, imp)), 'created': created, 'updated': updated,
             'last_used': last_used, 'used': max(0, used), 'pinned': pinned,
             'src': src, 'sid': sid}
@@ -1089,12 +1100,51 @@ def _mem_items_to_lines(items, with_prefix=False):
 
 
 def _mem_read_md(profile_id):
-    """直接读镜像 md（不经 v2 分发，避免迁移时自我递归）。"""
+    """Read the legacy mirror without hiding I/O or decoding failures."""
+    return read_profile_memory_raw(profile_id)
+
+
+def _mem_validate_json(obj):
+    if not isinstance(obj, dict) or not isinstance(obj.get('items'), list):
+        raise ValueError('memory must contain an items array')
+    ids = set()
+    for item in obj['items']:
+        if (not isinstance(item, dict) or not isinstance(item.get('text'), str)
+                or not item['text'].strip() or not isinstance(item.get('id'), str)
+                or not item['id'].strip() or item['id'] in ids):
+            raise ValueError('invalid or duplicate memory item')
+        ids.add(item['id'])
+
+
+def _mem_read_json(profile_id):
     try:
-        with open(_profile_memory_file(profile_id), 'r', encoding='utf-8') as f:
-            return f.read()
-    except Exception:
-        return ''
+        with open(_mem_json_path(profile_id), 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        _mem_validate_json(obj)
+        return obj
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        raise MemoryReadError('Saved structured memory is unreadable; restore from an archive') from e
+
+
+def _backup_corrupt_memory(path):
+    import tempfile
+    import shutil
+    fd, backup = tempfile.mkstemp(prefix='.zqy-memory-corrupt-', suffix='.bak',
+                                   dir=os.path.dirname(os.path.abspath(path)))
+    with os.fdopen(fd, 'wb') as dest, open(path, 'rb') as source:
+        shutil.copyfileobj(source, dest)
+
+
+def _mem_write_mirror(profile_id, items, migrate=False):
+    md = _profile_memory_file(profile_id)
+    if migrate and os.path.isfile(md):
+        os.replace(md, md + '.bak')
+    mtmp = md + '.tmp'
+    with open(mtmp, 'w', encoding='utf-8') as f:
+        f.write(strip_lone_surrogates('\n'.join(_mem_items_to_lines(items, with_prefix=True))))
+    os.replace(mtmp, md)
 
 
 def _mem_evict_key(item):
@@ -1113,7 +1163,7 @@ def _mem_evict_key(item):
     return (max(1, min(5, imp)), str(item.get('created') or ''), str(item.get('id') or ''))
 
 
-def _mem_save_v2(profile_id, data, migrate=False, enforce_limit=True):
+def _mem_save_v2(profile_id, data, migrate=False, enforce_limit=True, repair=False):
     """原子写 JSON（真身）+ 同步镜像 md；migrate=True 时把旧 md 另存 .md.bak。
 
     整段持 MEM_LOCK（RLock，可重入）：临时文件名是固定后缀，两个写者同时进来会互相
@@ -1131,8 +1181,22 @@ def _mem_save_v2(profile_id, data, migrate=False, enforce_limit=True):
         dropped_items = list(evicted)
         items = pinned[:MEM_MAX_ITEMS] + (rest[-room:] if room else [])
     payload = {'v': 2, 'updated': int(time.time()), 'items': items}
+    _mem_validate_json(payload)
     prev_dropped = data.get('dropped') if isinstance(data.get('dropped'), dict) else None
     with MEM_LOCK:
+        try:
+            old = _mem_read_json(profile_id)
+        except MemoryReadError:
+            if not repair:
+                raise
+            _backup_corrupt_memory(_mem_json_path(profile_id))
+            old = None
+        try:
+            _mem_read_md(profile_id)
+        except MemoryReadError:
+            if not repair:
+                raise
+            _backup_corrupt_memory(_profile_memory_file(profile_id))
         if dropped_items:
             # 落进 json，供 /api/status 报「被淘汰过什么」。只留最近一次的摘要，避免体积膨胀。
             payload['dropped'] = {
@@ -1151,28 +1215,16 @@ def _mem_save_v2(profile_id, data, migrate=False, enforce_limit=True):
             # 而「被挤掉的记忆」恰恰是用户在下次写入之后才最需要看到的。
             # items 为空时不带：整表清空（clear/replace 成空表）后还显示「已淘汰 N 条」
             # 会把「被你删掉的」误报成「被上限挤掉的」。
-            try:
-                with open(_mem_json_path(profile_id), 'r', encoding='utf-8') as f:
-                    old = json.load(f)
-                if isinstance(old, dict) and isinstance(old.get('dropped'), dict):
-                    payload['dropped'] = old['dropped']
-            except Exception:
-                pass
+            if isinstance(old, dict) and isinstance(old.get('dropped'), dict):
+                payload['dropped'] = old['dropped']
         os.makedirs(MEMORY_DIR, exist_ok=True)
         path = _mem_json_path(profile_id)
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             f.write(json_dumps(payload, ensure_ascii=False, indent=1))
         os.replace(tmp, path)
-        md = _profile_memory_file(profile_id)
         try:
-            if migrate and os.path.isfile(md):
-                os.replace(md, md + '.bak')
-            mtmp = md + '.tmp'
-            with open(mtmp, 'w', encoding='utf-8') as f:
-                f.write(strip_lone_surrogates(
-                    '\n'.join(_mem_items_to_lines(items, with_prefix=True))))
-            os.replace(mtmp, md)
+            _mem_write_mirror(profile_id, items, migrate=migrate)
         except Exception as e:
             sys.stderr.write('[memory] mirror md failed: %s\n' % str(e)[:120])
     if dropped_items:
@@ -1182,40 +1234,25 @@ def _mem_save_v2(profile_id, data, migrate=False, enforce_limit=True):
 
 
 def _mem_load_v2(profile_id):
-    """读取（必要时从 md 迁移）。始终返回 dict，绝不抛异常。
-
-    整个「读文件」过程持 MEM_LOCK（RLock，可重入）：写侧是「临时文件 + os.replace」，
-    若读侧同时持有该文件句柄，Windows 上 os.replace 会直接抛 WinError 5 而被吞成
-    「写入失败」——表现为并发下静默丢记忆。串行化读与替换即可根除。
-    """
-    try:
-        path = _mem_json_path(profile_id)
-        if os.path.isfile(path):
-            try:
-                with MEM_LOCK:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        obj = json.load(f)
-            except Exception:
-                obj = None                       # json 损坏 → 走下方重建
-            if isinstance(obj, dict) and isinstance(obj.get('items'), list):
-                obj['v'] = 2
-                md = _profile_memory_file(profile_id)
-                if not os.path.isfile(md):
-                    # 镜像丢了（人为删除/迁移中断）→ 立刻补回，避免旧接口读到空表
-                    _mem_save_v2(profile_id, obj)
-                return obj
+    """Only migrate absent JSON; corrupt files remain untouched for recovery."""
+    with MEM_LOCK:
+        obj = _mem_read_json(profile_id)
+        if obj is not None:
+            if not os.path.isfile(_profile_memory_file(profile_id)):
+                try:
+                    _mem_write_mirror(profile_id, obj['items'])
+                except Exception as e:
+                    sys.stderr.write('[memory] mirror repair failed: %s\n' % str(e)[:120])
+            return obj
         lines = [ln for ln in _mem_read_md(profile_id).split('\n') if ln.strip().startswith('- ')]
-        items = [it for it in (_mem_norm_item(ln) for ln in lines) if it]
+        items = [it for it in (_mem_norm_item(ln, truncate=False) for ln in lines) if it]
         data = {'v': 2, 'updated': int(time.time()), 'items': items}
         if items or os.path.isfile(_profile_memory_file(profile_id)):
-            data = _mem_save_v2(profile_id, data, migrate=True)
+            data = _mem_save_v2(profile_id, data, migrate=True, enforce_limit=False)
         return data
-    except Exception as e:
-        sys.stderr.write('[memory] load v2 failed: %s\n' % str(e)[:160])
-        return {'v': 2, 'updated': 0, 'items': []}
 
 
-def _mem_reconcile(profile_id, lines, hints=None):
+def _mem_reconcile(profile_id, lines, hints=None, truncate=True):
     """把「整行列表」（旧接口的输入形态）与现有结构化条目对齐：
     - 文本完全相同的条目原地保留 id / cat / imp / pinned / used（编辑、改说法都不丢元数据）
     - 新条目用 hints 或本地启发式补 cat / imp
@@ -1254,7 +1291,7 @@ def _mem_reconcile(profile_id, lines, hints=None):
             imp = int(hint.get('imp') or 3)
         except (TypeError, ValueError):
             imp = 3
-        out.append({'id': _mem_new_id(), 'text': text[:MEM_ITEM_TEXT_MAX], 'cat': cat,
+        out.append({'id': _mem_new_id(), 'text': text[:MEM_ITEM_TEXT_MAX] if truncate else text, 'cat': cat,
                     'imp': max(1, min(5, imp)), 'created': ts or now, 'updated': now,
                     'last_used': '', 'used': 0, 'pinned': False, 'src': 'chat', 'sid': ''})
     return out
@@ -1415,7 +1452,7 @@ def select_memory_for_prompt(profile_id, query, budget=None, citations=False):
                         it['used'] = int(it.get('used') or 0) + 1
                         touched = True
                 if touched:
-                    _mem_save_v2(profile_id, {'items': fresh})
+                    _mem_save_v2(profile_id, {'items': fresh}, enforce_limit=False)
         except Exception as e:
             sys.stderr.write('[memory] touch failed: %s\n' % str(e)[:120])
     sys.stderr.write('[memory-select] pid=%s cand=%d picked=%d dropped=%d chars=%d budget=%d\n'
@@ -1538,6 +1575,8 @@ def write_profile_memory_v2(profile_id, text, cat=None, imp=None):
             items.append(new)
             _mem_save_v2(profile_id, {'items': items})
             return {'ok': True, 'duplicate': False, 'item': new}
+    except MemoryReadError:
+        raise
     except Exception as e:
         sys.stderr.write('[memory] add v2 failed: %s\n' % str(e)[:160])
         return {'ok': False, 'duplicate': False, 'item': None}
@@ -1578,8 +1617,10 @@ def update_profile_memory_v2(profile_id, item_id=None, index=None, text=None, ca
             if pinned is not None:
                 target['pinned'] = bool(pinned)
             target['updated'] = _mem_now_str()
-            _mem_save_v2(profile_id, {'items': items})
+            _mem_save_v2(profile_id, {'items': items}, enforce_limit=False)
             return True
+    except MemoryReadError:
+        raise
     except Exception as e:
         sys.stderr.write('[memory] update v2 failed: %s\n' % str(e)[:160])
         return False
@@ -1613,8 +1654,10 @@ def delete_profile_memory_v2(profile_id, item_id=None, index=None, text=None):
             if pos is None:
                 return False
             del items[pos]
-            _mem_save_v2(profile_id, {'items': items})
+            _mem_save_v2(profile_id, {'items': items}, enforce_limit=False)
             return True
+    except MemoryReadError:
+        raise
     except Exception as e:
         sys.stderr.write('[memory] delete v2 failed: %s\n' % str(e)[:160])
         return False
@@ -1815,26 +1858,22 @@ def status_snapshot(profile_id):
 
 
 def memory_snapshot(profile_id):
-    """GET /api/memory 的返回体：旧字段 items 原样保留（旧前端零改动），另附 items_v2 / stats。
-    注意：v2 关闭时【不读也算】—— 避免一次只读请求顺手落盘一个新文件，
-    也避免 V2 关闭期间返回 items_v2、把前端引到一条当前并不生效的数据源上。"""
-    out = {'items': profile_memory_items(profile_id)}
-    try:
+    """Read one coherent snapshot; never label an unreadable file as empty."""
+    with MEM_LOCK:
+        out = {'v2': bool(MEMORY_V2)}
         if MEMORY_V2:
             data = _mem_load_v2(profile_id)
-            items = data.get('items') or []
+            items = data['items']
+            out['items'] = _mem_items_to_lines(items)
             out['items_v2'] = items
             dropped = data.get('dropped') if isinstance(data.get('dropped'), dict) else {}
-            # dropped_last 是 docs/记忆管理施工方案.md §API 里早已写死的字段名，
-            # 之前一直没实现；这里补上，与 status 的 memory.dropped.count 同源。
             out['stats'] = {'total': len(items),
                             'pinned': len([it for it in items if it.get('pinned')]),
                             'dropped_last': str(dropped.get('at') or '') if dropped else '',
                             'dropped_count': int(dropped.get('count') or 0) if dropped else 0}
-        out['v2'] = bool(MEMORY_V2)
-    except Exception as e:
-        sys.stderr.write('[memory] snapshot v2 failed: %s\n' % str(e)[:140])
-    return out
+        else:
+            out['items'] = profile_memory_items(profile_id)
+        return out
 
 
 STORAGE_LOCK = threading.RLock()
@@ -2829,7 +2868,7 @@ def merge_profile_memory(profile_id, raw_items):
             texts = set(_mem_norm_text(item.get('text') or '') for item in items)
             ids = set(item.get('id') for item in items)
             for raw in raw_items:
-                item = _mem_norm_item(raw)
+                item = _mem_norm_item(raw, truncate=False)
                 if not item:
                     continue
                 text = _mem_norm_text(item['text'])
@@ -2842,13 +2881,13 @@ def merge_profile_memory(profile_id, raw_items):
                 ids.add(item['id'])
             data['items'] = items
             _bump_memory_epoch(profile_id)
-            _mem_save_v2(profile_id, data)
+            _mem_save_v2(profile_id, data, enforce_limit=False)
             return True
         items = profile_memory_items(profile_id)
         texts = set(_mem_norm_text(_split_mem_item(line)[1]) for line in items)
         for raw in raw_items:
             if isinstance(raw, dict):
-                item = _mem_norm_item(raw)
+                item = _mem_norm_item(raw, truncate=False)
                 lines = _mem_items_to_lines([item]) if item else []
             else:
                 lines = [str(raw or '').strip()]
@@ -2857,7 +2896,7 @@ def merge_profile_memory(profile_id, raw_items):
                 if text and text not in texts:
                     items.append(line)
                     texts.add(text)
-        return replace_profile_memory(profile_id, items)
+        return replace_profile_memory(profile_id, items, preserve=True)
 
 
 def restore_profile_memory(profile_id, lines):
@@ -5861,8 +5900,8 @@ def archive_export(profile_id='default'):
             obj = json.loads(raw.decode('utf-8'))
             if name == 'storage.json' and not valid_storage_data(obj):
                 raise ValueError('invalid storage data in backup')
-            if name.startswith('memories/') and (not isinstance(obj, dict) or not isinstance(obj.get('items'), list) or not all(_archive_memory_item(item) for item in obj['items'])):
-                raise ValueError('invalid memory data in backup')
+            if name.startswith('memories/'):
+                _mem_validate_json(obj)
             if name.startswith('recall/') and (not isinstance(obj, dict) or not isinstance(obj.get('items'), dict)):
                 raise ValueError('invalid recall data in backup')
             zf.writestr(strip_lone_surrogates(name), raw)
@@ -5969,6 +6008,7 @@ def archive_import(blob, force=False):
                     valid = all(item is not None for item in normalized)
                     if valid:
                         obj['items'] = normalized
+                        _mem_validate_json(obj)
             else:
                 valid = (isinstance(obj, dict) and isinstance(obj.get('items'), dict)
                          and isinstance(obj.get('days', {}), dict))
@@ -6012,11 +6052,18 @@ def archive_import(blob, force=False):
             if sub == 'memories':
                 profile = os.path.splitext(name)[0]
                 with MEM_LOCK:
+                    if not force:
+                        try:
+                            _mem_read_json(profile)
+                            _mem_read_md(profile)
+                        except MemoryReadError:
+                            out['error_code'] = 'memory_unreadable'
+                            raise
                     if not force and (os.path.exists(target) or os.path.exists(_profile_memory_file(profile))):
                         result = 'skipped_exists'
                     else:
                         _bump_memory_epoch(profile)
-                        _mem_save_v2(profile, obj, enforce_limit=False)
+                        _mem_save_v2(profile, obj, enforce_limit=False, repair=force)
                         result = 'restored'
             else:
                 result = _archive_write(target, text, force)
@@ -6637,7 +6684,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == 'replace':
                     items = payload.get('items')
                     self._send(200, {'ok': replace_profile_memory(profile_id, items,
-                                                               expected_items=payload.get('expected_items')),
+                                                               expected_items=payload.get('expected_items'), preserve=True),
                                      'count': len(items)})
                 elif action == 'migrate':
                     data = _mem_load_v2(profile_id)
@@ -6729,6 +6776,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 result = handle_chat(payload)
                 self._send(200, result)
+        except MemoryReadError:
+            self._send(503, {'ok': False, 'error': 'Saved memory is unreadable; restore from an archive',
+                             'error_code': 'memory_unreadable'})
         except MemoryConflictError:
             self._send(409, {'ok': False, 'error': 'Memory changed; refresh before editing',
                              'error_code': 'memory_conflict'})
@@ -6770,7 +6820,11 @@ class Handler(BaseHTTPRequestHandler):
         if re.search(r'/api/memory$', path_only):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             pid = (query.get('profile_id') or ['default'])[0]
-            self._send(200, memory_snapshot(pid))
+            try:
+                self._send(200, memory_snapshot(pid))
+            except MemoryReadError:
+                self._send(503, {'error': 'Saved memory is unreadable; restore from an archive',
+                                 'error_code': 'memory_unreadable'})
             return
         if re.search(r'/api/settings$', path_only):
             try:

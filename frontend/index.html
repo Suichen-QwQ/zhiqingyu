@@ -4584,13 +4584,15 @@
     /* 统一 POST：网络失败不抛错（net:true），交给调用方按 ok 走分支 */
     async function memPost(body){
       const payload=Object.assign({profile_id:profileId()},body||{});
+      const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),30000);
       try{
         const r=await fetch('api/memory',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(payload)});
+          body:JSON.stringify(payload),signal:ctrl.signal});
         let d=null;
         try{ d=await r.json(); }catch(e){}
         return {ok:!!(r.ok&&d&&d.ok),status:r.status,data:d,net:false};
       }catch(e){ return {ok:false,status:0,data:null,net:true}; }
+      finally{clearTimeout(timer);}
     }
     /* GET 归一化：items_v2 优先；旧后端没有 items_v2 → 用 items 按原样解析（无分类/重要度/置顶） */
     function memBuildRows(data,targetProfile=profileId()){
@@ -5386,6 +5388,9 @@
         const file=input.files&&input.files[0]; if(!file) return;
         const reader=new FileReader();
         reader.onload=async function(){
+          if(cloudBusy||cloudState==='pending'){showToast('正在同步或导入，请稍后重试');return;}
+          cloudBusy=true;let applied=false;
+          if(cloudT){clearTimeout(cloudT);cloudT=null;}
           try{
             const backup=JSON.parse(reader.result,(key,value)=>['__proto__','constructor','prototype'].includes(key)?undefined:value), selected=selectBackupData(backup,window.prompt.bind(window));
             if(!selected)return;
@@ -5398,10 +5403,15 @@
             else { const merged=mergeBackupData(DB,data,uid);DB.sessions=merged.sessions;DB.diary=merged.diary;DB.meta=merged.meta; }
             normalizeDB();
             profileId(); if(!DB.sessions.length) newSession(); if(!DB.sessions.some(s=>s.id===DB.activeId)) DB.activeId=DB.sessions[0].id;
-            const memOk=selected.primary?await memImport(backup,overwrite):true;   /* 优先 memory_v2，旧备份走 memory */
-            dbSave(); refreshView(); showToast(overwrite?'备份已恢复':'备份已合并');
+            applied=true;dbSave();persistLocalSnapshot();refreshView();
+            const memOk=selected.primary?await memImport(backup,overwrite):true;
+            showToast(overwrite?'备份已恢复':'备份已合并');
             if(!memOk) showToast('对话已恢复，记忆没能一起恢复');
-          }catch(e){ showToast('备份格式不正确，未导入'); }
+          }catch(e){ showToast(applied?'对话已恢复，后续处理未完成，请先导出备份':'备份格式不正确，未导入'); }
+          finally{
+            cloudBusy=false;
+            if(cloudState!=='error'&&cloudState!=='pending'&&cloudGeneration!==cloudSavedGeneration)cloudSync();
+          }
         };
         reader.readAsText(file,'utf-8');
       });
@@ -5440,8 +5450,8 @@
           const response=await fetch('api/archive?action=import'+(overwrite?'&force=1':'')+'&profile_id='+encodeURIComponent(importProfile),
             {method:'POST',headers:{'Content-Type':'application/zip'},body:buf});
           const data=await response.json();restored=!!(data&&data.storage==='restored');
-          if(!overwrite&&data&&data.error_code==='storage_unreadable'){
-            const repair=await zqyConfirm({title:'云端数据无法读取',body:'是否用这份归档修复？服务端会先保留损坏文件副本。',ok:'用归档修复',cancel:'保留原文件',danger:true});
+          if(!overwrite&&data&&['storage_unreadable','memory_unreadable'].includes(data.error_code)){
+            const repair=await zqyConfirm({title:'云端数据无法读取',body:'是否用这份归档覆盖并修复？归档中对应的对话、记忆和回忆会被替换；服务端会先保留损坏文件副本。',ok:'用归档修复',cancel:'保留原文件',danger:true});
             if(repair){overwrite=true;continue;}
           }
           if(!response.ok||!data||data.ok!==true)throw new Error((data&&data.error)||'归档导入失败');

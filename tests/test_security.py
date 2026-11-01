@@ -41,6 +41,12 @@ class SecurityTests(unittest.TestCase):
         TEMP.cleanup()
 
     def setUp(self):
+        from unittest.mock import patch
+        for field, directory in (('MEMORY_DIR', 'memory'), ('RECALL_DIR', 'recall')):
+            isolated = DATA / self._testMethodName / directory
+            patcher = patch.object(server, field, str(isolated))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         settings = DATA / 'settings.json'
         if settings.exists():
             settings.unlink()
@@ -300,8 +306,8 @@ class SecurityTests(unittest.TestCase):
 
     def test_archive_memory_import_shares_live_writer_lock(self):
         from concurrent.futures import ThreadPoolExecutor
-        path = DATA / 'memory' / 'archive-race.json'
-        path.parent.mkdir(exist_ok=True)
+        path = Path(server.MEMORY_DIR) / 'archive-race.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
         started, finished = threading.Event(), threading.Event()
         def importing():
             started.set()
@@ -785,6 +791,155 @@ class SecurityTests(unittest.TestCase):
             self.assertTrue(json.loads(post({'action': 'replace', 'items': ['edited fact'],
                                             'expected_items': current[1:]})[2])['ok'])
             self.assertEqual(server.profile_memory_items(pid), ['edited fact'])
+
+    def test_corrupt_structured_memory_is_not_rebuilt_or_overwritten(self):
+        from unittest.mock import patch
+        pid = 'corrupt-memory-protection'
+        with patch.object(server, 'MEMORY_V2', True):
+            server.replace_profile_memory(pid, [{'id': 'original', 'text': 'original fact', 'pinned': True}])
+            path = Path(server._mem_json_path(pid))
+            original = b'{broken structured memory'
+            path.write_bytes(original)
+            mirror = Path(server._profile_memory_file(pid)).read_bytes()
+            status, _, body = self.request('GET', '/api/memory?profile_id=' + pid)
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)['error_code'], 'memory_unreadable')
+            for action in ({'action': 'add', 'text': 'new fact'},
+                           {'action': 'update', 'id': 'original', 'text': 'changed'},
+                           {'action': 'delete', 'id': 'original'},
+                           {'action': 'replace', 'items': []},
+                           {'action': 'replace', 'items': [{'id': 'new', 'text': 'new fact'}]},
+                           {'action': 'merge', 'items': ['imported fact']}):
+                payload = dict(action, profile_id=pid)
+                status, _, _ = self.request('POST', '/api/memory', json.dumps(payload).encode(),
+                                            {'Content-Type': 'application/json'})
+                self.assertEqual(status, 503, action)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(Path(server._profile_memory_file(pid)).read_bytes(), mirror)
+
+    def test_invalid_memory_entries_fail_closed(self):
+        from unittest.mock import patch
+        pid = 'invalid-memory-shapes'
+        path = Path(server._mem_json_path(pid))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with patch.object(server, 'MEMORY_V2', True):
+            for value in ([], {'items': {}}, {'items': [None]}, {'items': [{'text': 'no id'}]},
+                          {'items': [{'id': 'x', 'text': 'one'}, {'id': 'x', 'text': 'two'}]}):
+                raw = json.dumps(value).encode()
+                path.write_bytes(raw)
+                with self.assertRaises(server.MemoryReadError):
+                    server.memory_snapshot(pid)
+                self.assertEqual(path.read_bytes(), raw)
+
+    def test_unreadable_legacy_memory_is_not_reported_as_empty(self):
+        from unittest.mock import patch
+        pid = 'corrupt-legacy-memory'
+        path = Path(server._profile_memory_file(pid))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = b'- invalid UTF8 \xff'
+        path.write_bytes(raw)
+        with patch.object(server, 'MEMORY_V2', False):
+            self.assertEqual(self.request('GET', '/api/memory?profile_id=' + pid)[0], 503)
+            payload = json.dumps({'profile_id': pid, 'action': 'replace', 'items': ['new']}).encode()
+            self.assertEqual(self.request('POST', '/api/memory', payload, {'Content-Type': 'application/json'})[0], 503)
+        self.assertEqual(path.read_bytes(), raw)
+        with patch.object(server, 'MEMORY_V2', True):
+            with self.assertRaises(server.MemoryReadError):
+                server._mem_load_v2(pid)
+        self.assertFalse(Path(server._mem_json_path(pid)).exists())
+
+    def test_legacy_migration_and_read_touches_preserve_full_archive(self):
+        from unittest.mock import patch
+        pid = 'full-migration-read'
+        facts = ['2026-11-01 09:00 legacy %s %s' % (i, 'x' * (server.MEM_ITEM_TEXT_MAX + 10))
+                 for i in range(server.MEM_MAX_ITEMS + 3)]
+        with server.MEM_LOCK:
+            server._atomic_write_memory(pid, facts)
+        with patch.object(server, 'MEMORY_V2', True):
+            snapshot = server.memory_snapshot(pid)
+            self.assertEqual(snapshot['items'], facts)
+            self.assertEqual(len(snapshot['items_v2']), len(facts))
+            path = Path(server._mem_json_path(pid))
+            original_json = path.read_bytes()
+            Path(server._profile_memory_file(pid)).unlink()
+            again = server.memory_snapshot(pid)
+            self.assertEqual(again['items'], facts)
+            self.assertEqual(path.read_bytes(), original_json)
+            self.assertEqual(server.profile_memory_items(pid), facts)
+            server.select_memory_for_prompt(pid, 'legacy', budget=10000)
+            self.assertEqual(server.memory_snapshot(pid)['items'], facts)
+
+    def test_memory_snapshot_uses_canonical_items_when_mirror_is_stale(self):
+        from unittest.mock import patch
+        pid = 'coherent-memory-snapshot'
+        with patch.object(server, 'MEMORY_V2', True):
+            server.replace_profile_memory(pid, [{'id': 'canonical', 'text': 'current fact'}])
+            Path(server._profile_memory_file(pid)).write_text('- old mirror fact', encoding='utf8')
+            snapshot = server.memory_snapshot(pid)
+            self.assertEqual([item['text'] for item in snapshot['items_v2']], ['current fact'])
+            self.assertEqual(len(snapshot['items']), 1)
+            self.assertTrue(snapshot['items'][0].endswith('current fact'))
+
+    def test_explicit_archive_repair_keeps_corrupt_memory_bytes(self):
+        import io
+        import zipfile
+        from unittest.mock import patch
+        pid = 'archive-repair-memory'
+        path = Path(server._mem_json_path(pid))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = b'{broken memory'
+        path.write_bytes(raw)
+        md = Path(server._profile_memory_file(pid))
+        md_raw = b'- corrupt legacy \xff'
+        md.write_bytes(md_raw)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('memories/' + pid + '.json', json.dumps({'items': [{'id': 'repaired', 'text': 'repaired fact'}]}))
+        with patch.object(server, 'MEMORY_V2', True):
+            result = server.archive_import(archive.getvalue(), False)
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['error_code'], 'memory_unreadable')
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(md.read_bytes(), md_raw)
+            self.assertTrue(server.archive_import(archive.getvalue(), True)['ok'])
+            self.assertEqual(server.memory_snapshot(pid)['items_v2'][0]['id'], 'repaired')
+        backups = [p.read_bytes() for p in path.parent.glob('.zqy-memory-corrupt-*.bak')]
+        self.assertIn(raw, backups)
+        self.assertIn(md_raw, backups)
+
+    def test_duplicate_memory_ids_rejected_before_archive_writes(self):
+        import io
+        import zipfile
+        before = server.read_storage()['revision']
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('storage.json', json.dumps({'sessions': [{'msgs': ['replacement']}]}))
+            zf.writestr('memories/duplicate-ids.json', json.dumps({'items': [
+                {'id': 'duplicate', 'text': 'one'}, {'id': 'duplicate', 'text': 'two'}]}))
+        self.assertFalse(server.archive_import(archive.getvalue(), True)['ok'])
+        self.assertEqual(server.read_storage()['revision'], before)
+
+    def test_json_memory_restore_preserves_long_facts_and_all_items(self):
+        from unittest.mock import patch
+        facts = [{'id': 'item-%s' % i, 'text': 'fact %s %s' % (i, 'x' * (server.MEM_ITEM_TEXT_MAX + 10)),
+                  'pinned': False} for i in range(server.MEM_MAX_ITEMS + 3)]
+        for v2 in (True, False):
+            pid = 'json-full-memory-' + str(v2)
+            with patch.object(server, 'MEMORY_V2', v2):
+                payload = json.dumps({'profile_id': pid, 'action': 'replace', 'items': facts}).encode()
+                status, _, body = self.request('POST', '/api/memory', payload, {'Content-Type': 'application/json'})
+                self.assertEqual(status, 200)
+                self.assertTrue(json.loads(body)['ok'])
+                snapshot = server.memory_snapshot(pid)
+                self.assertEqual(len(snapshot['items']), len(facts))
+                self.assertTrue(snapshot['items'][-1].endswith(facts[-1]['text']))
+                self.assertTrue(server.merge_profile_memory(pid, [{'id': 'extra', 'text': 'extra long ' + 'z' * 150}]))
+                self.assertEqual(len(server.memory_snapshot(pid)['items']), len(facts) + 1)
+                if v2:
+                    self.assertTrue(server.update_profile_memory_v2(pid, item_id='item-0', pinned=True))
+                    self.assertEqual(len(server.memory_snapshot(pid)['items_v2']), len(facts) + 1)
+                    self.assertTrue(server.delete_profile_memory_v2(pid, item_id='extra'))
+                    self.assertEqual(len(server.memory_snapshot(pid)['items_v2']), len(facts))
 
     def test_revision_required(self):
         status, _, _ = self.request('POST', '/api/storage', b'{"data":{}}', {'Content-Type': 'application/json'})
